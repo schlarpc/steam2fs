@@ -91,6 +91,9 @@ pub struct Manifest {
     pub fingerprint: u32,
     nodes: Vec<Node>,
     string_table: Vec<u8>,
+    /// Parallel to `nodes`: each name's length, found once at parse time so
+    /// that reading a name is a slice rather than a scan for its terminator.
+    name_len: Vec<u32>,
     /// Every node that has a parent, sorted by (parent, name), so a child
     /// can be found by binary search against the string table - without a
     /// second copy of every name, or an allocation per lookup.
@@ -163,12 +166,18 @@ impl Manifest {
             fingerprint,
             nodes,
             string_table,
+            name_len: Vec::new(),
             by_name: Vec::new(),
         };
+        let mut name_len = Vec::with_capacity(m.nodes.len());
         for (i, n) in m.nodes.iter().enumerate() {
-            if n.name_offset as usize >= m.string_table.len() {
+            let Some(rest) = m.string_table.get(n.name_offset as usize..) else {
                 return Err(malformed(format!("node {i}: name offset out of range")));
-            }
+            };
+            let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            name_len.push(
+                u32::try_from(len).map_err(|_| malformed(format!("node {i}: name too long")))?,
+            );
             if n.parent != NO_NODE && n.parent as usize >= m.nodes.len() {
                 return Err(malformed(format!("node {i}: parent out of range")));
             }
@@ -184,6 +193,7 @@ impl Manifest {
                 }
             }
         }
+        m.name_len = name_len;
         let mut by_name: Vec<u32> = (0..m.nodes.len() as u32)
             .filter(|i| m.nodes[*i as usize].parent != NO_NODE)
             .collect();
@@ -204,12 +214,12 @@ impl Manifest {
     /// Empty for an unknown node; `parse` has already range-checked every
     /// name offset, so a real node always has a name.
     pub fn name(&self, idx: u32) -> &[u8] {
-        let Some(start) = self.nodes.get(idx as usize).map(|n| n.name_offset as usize) else {
+        let Some(node) = self.nodes.get(idx as usize) else {
             return &[];
         };
-        let rest = &self.string_table[start..];
-        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-        &rest[..end]
+        let start = node.name_offset as usize;
+        let len = self.name_len.get(idx as usize).copied().unwrap_or(0) as usize;
+        self.string_table.get(start..start + len).unwrap_or(&[])
     }
 
     /// The root node index (parent == NO_NODE), normally 0.
