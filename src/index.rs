@@ -55,22 +55,51 @@ pub struct DatEntry {
 pub struct Depot {
     /// Sorted by (version, crc).
     pub blobs: Vec<BlobId>,
-    /// Directory name -> blob, e.g. `12` or `12-0050a99e` when forked.
-    names: Vec<(String, BlobId)>,
+    /// Parallel to `blobs`: the version directory name (`12`, or
+    /// `12-0050a99e` when several blobs share a version number) and the
+    /// `by-date/` link name. Both are built once, at index time.
+    names: Vec<(String, String)>,
+    by_name: HashMap<String, BlobId>,
+    by_date_link: HashMap<String, BlobId>,
+    /// `blobs` in `by-date/` listing order.
+    date_order: Vec<BlobId>,
+    index_of: HashMap<BlobId, usize>,
 }
 
 impl Depot {
-    pub fn version_names(&self) -> &[(String, BlobId)] {
-        &self.names
-    }
-    pub fn lookup_name(&self, name: &str) -> Option<BlobId> {
-        self.names.iter().find(|(n, _)| n == name).map(|(_, b)| *b)
-    }
-    pub fn name_of(&self, id: BlobId) -> Option<&str> {
+    /// Version directory names, oldest first.
+    pub fn versions(&self) -> impl Iterator<Item = (&str, BlobId)> + '_ {
         self.names
             .iter()
-            .find(|(_, b)| *b == id)
             .map(|(n, _)| n.as_str())
+            .zip(self.blobs.iter().copied())
+    }
+
+    /// `by-date/` link names, in listing order.
+    pub fn date_links(&self) -> impl Iterator<Item = (&str, BlobId)> + '_ {
+        self.date_order
+            .iter()
+            .map(|b| (self.date_link_of(*b).unwrap_or(""), *b))
+    }
+
+    pub fn lookup_name(&self, name: &str) -> Option<BlobId> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn lookup_date_link(&self, name: &str) -> Option<BlobId> {
+        self.by_date_link.get(name).copied()
+    }
+
+    fn nth(&self, id: BlobId) -> Option<&(String, String)> {
+        self.names.get(*self.index_of.get(&id)?)
+    }
+
+    pub fn name_of(&self, id: BlobId) -> Option<&str> {
+        self.nth(id).map(|n| n.0.as_str())
+    }
+
+    pub fn date_link_of(&self, id: BlobId) -> Option<&str> {
+        self.nth(id).map(|n| n.1.as_str())
     }
 }
 
@@ -135,6 +164,33 @@ pub fn parse_date(s: &str) -> Option<SystemTime> {
     }
     let secs = days as u64 * 86_400 + h * 3600 + mi * 60 + sec;
     Some(UNIX_EPOCH + Duration::new(secs, nanos))
+}
+
+/// `YYYY-MM-DDTHH-MM-SS` for a unix timestamp (UTC).
+pub fn format_stamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}",
+        rem / 3600,
+        (rem / 60) % 60,
+        rem % 60
+    )
+}
+
+/// The inverse of `days_from_civil` (Howard Hinnant).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant).
@@ -239,9 +295,31 @@ impl Index {
                     } else {
                         e.version.to_string()
                     };
-                    (name, *b)
+                    let stamp = e
+                        .date
+                        .and_then(|d| d.duration_since(UNIX_EPOCH).ok())
+                        .map_or_else(|| "unknown".to_string(), |d| format_stamp(d.as_secs()));
+                    let link = format!("{stamp}_v{name}");
+                    (name, link)
                 })
                 .collect();
+            depot.index_of = depot.blobs.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+            depot.by_name = depot
+                .names
+                .iter()
+                .zip(&depot.blobs)
+                .map(|((n, _), b)| (n.clone(), *b))
+                .collect();
+            depot.by_date_link = depot
+                .names
+                .iter()
+                .zip(&depot.blobs)
+                .map(|((_, l), b)| (l.clone(), *b))
+                .collect();
+            let mut order: Vec<usize> = (0..depot.blobs.len()).collect();
+            order.sort_by(|&a, &b| depot.names[a].1.cmp(&depot.names[b].1));
+            let ordered: Vec<BlobId> = order.into_iter().map(|i| depot.blobs[i]).collect();
+            depot.date_order = ordered;
         }
 
         tracing::info!(
@@ -321,5 +399,17 @@ mod tests {
         assert_eq!(secs.subsec_nanos(), 15_625_000);
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    }
+
+    #[test]
+    fn formats_stamps() {
+        assert_eq!(format_stamp(0), "1970-01-01T00-00-00");
+        assert_eq!(format_stamp(1_063_199_519), "2003-09-10T13-11-59");
+        // civil_from_days is the inverse of days_from_civil over a long run
+        // of dates, including leap days and century boundaries.
+        for day in 0..40_000i64 {
+            let (y, m, d) = civil_from_days(day);
+            assert_eq!(days_from_civil(y, m, d), day, "day {day} -> {y}-{m}-{d}");
+        }
     }
 }

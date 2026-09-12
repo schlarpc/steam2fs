@@ -28,7 +28,7 @@ use fuser::{
 use parking_lot::RwLock;
 
 use crate::format::manifest::{flags, Manifest, Node, NO_NODE};
-use crate::index::BlobId;
+use crate::index::{format_stamp, BlobId};
 use crate::store::{FileLoc, ReadError, Store};
 
 const TTL: Duration = Duration::from_secs(3600);
@@ -136,21 +136,6 @@ impl Steam2Fs {
         self.store.index.blob(id).date.unwrap_or(UNIX_EPOCH)
     }
 
-    fn date_link_name(&self, id: BlobId) -> String {
-        let e = self.store.index.blob(id);
-        let stamp = e
-            .date
-            .and_then(|d| d.duration_since(UNIX_EPOCH).ok())
-            .map_or_else(|| "unknown".to_string(), |d| format_stamp(d.as_secs()));
-        let vname = self
-            .store
-            .index
-            .depot(e.depot)
-            .and_then(|d| d.name_of(id))
-            .unwrap_or("?");
-        format!("{stamp}_v{vname}")
-    }
-
     fn manifest(&self, id: BlobId) -> Result<Arc<Manifest>, ReadError> {
         Ok(self.store.parsed(id)?.manifest.clone())
     }
@@ -219,6 +204,7 @@ impl Steam2Fs {
                     .depot(self.store.index.blob(b).depot)
                     .and_then(|x| x.name_of(b))
                     .unwrap_or("");
+                // The target is `../<version>`.
                 self.attr(
                     ino,
                     FileType::Symlink,
@@ -325,32 +311,6 @@ impl NodeDefault for Option<crate::format::manifest::Node> {
     }
 }
 
-/// `YYYY-MM-DDTHH-MM-SS` for a unix timestamp (UTC).
-pub fn format_stamp(secs: u64) -> String {
-    let days = secs / 86_400;
-    let rem = secs % 86_400;
-    let (y, m, d) = civil_from_days(days as i64);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}",
-        rem / 3600,
-        (rem / 60) % 60,
-        rem % 60
-    )
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 impl Filesystem for Steam2Fs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(pkey) = self.key(parent) else {
@@ -375,12 +335,7 @@ impl Filesystem for Steam2Fs {
             },
             Key::ByDate(d) => idx
                 .depot(d)
-                .and_then(|dep| {
-                    dep.blobs
-                        .iter()
-                        .copied()
-                        .find(|b| self.date_link_name(*b) == name_str)
-                })
+                .and_then(|dep| dep.lookup_date_link(&name_str))
                 .map(Key::DateLink),
             Key::Version(_) | Key::Node(..) => {
                 let blob = match pkey {
@@ -484,8 +439,8 @@ impl Filesystem for Steam2Fs {
             }
             Key::Depot(d) => {
                 if let Some(dep) = idx.depot(d) {
-                    for (name, b) in dep.version_names() {
-                        entries.push((name.clone().into(), Key::Version(*b), FileType::Directory));
+                    for (name, b) in dep.versions() {
+                        entries.push((name.into(), Key::Version(b), FileType::Directory));
                     }
                     if idx.latest(d).is_some() {
                         entries.push(("latest".into(), Key::Latest(d), FileType::Symlink));
@@ -495,13 +450,7 @@ impl Filesystem for Steam2Fs {
             }
             Key::ByDate(d) => {
                 if let Some(dep) = idx.depot(d) {
-                    let mut links: Vec<(String, BlobId)> = dep
-                        .blobs
-                        .iter()
-                        .map(|b| (self.date_link_name(*b), *b))
-                        .collect();
-                    links.sort();
-                    for (name, b) in links {
+                    for (name, b) in dep.date_links() {
                         entries.push((name.into(), Key::DateLink(b), FileType::Symlink));
                     }
                 }
