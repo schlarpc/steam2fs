@@ -25,7 +25,7 @@ use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, OpenFlags,
     ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::format::manifest::{flags, Manifest, Node, NO_NODE};
 use crate::index::{format_stamp, BlobId};
@@ -72,9 +72,21 @@ impl Inodes {
     }
 }
 
+/// One directory's listing: (name, what it points at, kind).
+type DirList = Arc<Vec<(OsString, Key, FileType)>>;
+
+/// Listings built by `opendir`, so that paging through a big directory
+/// does not rebuild it once per `readdir` call.
+#[derive(Default)]
+struct OpenDirs {
+    next: u64,
+    open: HashMap<u64, DirList>,
+}
+
 pub struct Steam2Fs {
     store: Arc<Store>,
     inodes: RwLock<Inodes>,
+    dirs: Mutex<OpenDirs>,
     uid: u32,
     gid: u32,
 }
@@ -91,6 +103,7 @@ impl Steam2Fs {
         Self {
             store,
             inodes: RwLock::new(Inodes::new()),
+            dirs: Mutex::new(OpenDirs::default()),
             uid,
             gid,
         }
@@ -227,6 +240,85 @@ impl Steam2Fs {
         let m = self.manifest(b)?;
         let n = m.node(idx).ok_or(ReadError::MissingRecord(idx))?;
         Ok((self.store.locate(b, n.file_id)?, m))
+    }
+
+    /// The full listing of a directory, built once per `opendir`.
+    fn dir_entries(&self, key: Key) -> Result<Vec<(OsString, Key, FileType)>, Errno> {
+        let idx = &self.store.index;
+        let mut entries: Vec<(OsString, Key, FileType)> = Vec::new();
+        let parent_key = match key {
+            Key::Root | Key::Depot(_) | Key::ByDate(_) | Key::Latest(_) | Key::DateLink(_) => {
+                Key::Root
+            }
+            Key::Version(b) => Key::Depot(idx.blob(b).depot),
+            Key::Node(b, i) => match self.manifest(b) {
+                Ok(m) => m
+                    .node(i)
+                    .map_or(Key::Version(b), |n| self.node_key(b, &m, n.parent)),
+                Err(_) => Key::Version(b),
+            },
+        };
+        entries.push((".".into(), key, FileType::Directory));
+        entries.push(("..".into(), parent_key, FileType::Directory));
+        match key {
+            Key::Root => {
+                for (d, _) in idx.depots() {
+                    entries.push((d.to_string().into(), Key::Depot(d), FileType::Directory));
+                }
+            }
+            Key::Depot(d) => {
+                if let Some(dep) = idx.depot(d) {
+                    for (name, b) in dep.versions() {
+                        entries.push((name.into(), Key::Version(b), FileType::Directory));
+                    }
+                    if idx.latest(d).is_some() {
+                        entries.push(("latest".into(), Key::Latest(d), FileType::Symlink));
+                    }
+                    entries.push(("by-date".into(), Key::ByDate(d), FileType::Directory));
+                }
+            }
+            Key::ByDate(d) => {
+                if let Some(dep) = idx.depot(d) {
+                    for (name, b) in dep.date_links() {
+                        entries.push((name.into(), Key::DateLink(b), FileType::Symlink));
+                    }
+                }
+            }
+            Key::Version(b) | Key::Node(b, _) => {
+                let m = self.manifest(b).map_err(|e| {
+                    tracing::warn!("readdir: {e}");
+                    errno(&e)
+                })?;
+                let dir = self.node_index(key, &m).ok_or(Errno::ENOTDIR)?;
+                if !m.node(dir).is_some_and(Node::is_dir) {
+                    return Err(Errno::ENOTDIR);
+                }
+                for c in m.children(dir) {
+                    let kind = if m.node(c).is_some_and(Node::is_dir) {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
+                    entries.push((
+                        OsString::from_vec(m.name(c).to_vec()),
+                        self.node_key(b, &m, c),
+                        kind,
+                    ));
+                }
+            }
+            Key::Latest(_) | Key::DateLink(_) => return Err(Errno::ENOTDIR),
+        }
+        Ok(entries)
+    }
+
+    /// The listing for an open directory handle, rebuilt from the inode if
+    /// the kernel reads a directory it did not open through us.
+    fn dir_list(&self, ino: INodeNo, fh: FileHandle) -> Result<DirList, Errno> {
+        if let Some(list) = self.dirs.lock().open.get(&fh.0) {
+            return Ok(list.clone());
+        }
+        let key = self.key(ino).ok_or(Errno::ENOENT)?;
+        Ok(Arc::new(self.dir_entries(key)?))
     }
 
     fn xattrs(&self, key: Key) -> Vec<(&'static str, String)> {
@@ -398,104 +490,91 @@ impl Filesystem for Steam2Fs {
         }
     }
 
-    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(FileHandle(0), FopenFlags::empty());
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let entries = match self.key(ino).ok_or(Errno::ENOENT).and_then(|k| self.dir_entries(k)) {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let mut dirs = self.dirs.lock();
+        dirs.next += 1;
+        let fh = dirs.next;
+        dirs.open.insert(fh, entries);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(key) = self.key(ino) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let idx = &self.store.index;
-        // (name, key, kind), built fully then paged by offset.
-        let mut entries: Vec<(OsString, Key, FileType)> = Vec::new();
-        let parent_key = match key {
-            Key::Root => Key::Root,
-            Key::Depot(_) | Key::ByDate(_) => Key::Root,
-            Key::Version(b) => Key::Depot(idx.blob(b).depot),
-            Key::Node(b, i) => match self.manifest(b) {
-                Ok(m) => m
-                    .node(i)
-                    .map_or(Key::Version(b), |n| self.node_key(b, &m, n.parent)),
-                Err(_) => Key::Version(b),
-            },
-            Key::Latest(_) | Key::DateLink(_) => Key::Root,
-        };
-        entries.push((".".into(), key, FileType::Directory));
-        entries.push(("..".into(), parent_key, FileType::Directory));
-        match key {
-            Key::Root => {
-                for (d, _) in idx.depots() {
-                    entries.push((d.to_string().into(), Key::Depot(d), FileType::Directory));
-                }
-            }
-            Key::Depot(d) => {
-                if let Some(dep) = idx.depot(d) {
-                    for (name, b) in dep.versions() {
-                        entries.push((name.into(), Key::Version(b), FileType::Directory));
-                    }
-                    if idx.latest(d).is_some() {
-                        entries.push(("latest".into(), Key::Latest(d), FileType::Symlink));
-                    }
-                    entries.push(("by-date".into(), Key::ByDate(d), FileType::Directory));
-                }
-            }
-            Key::ByDate(d) => {
-                if let Some(dep) = idx.depot(d) {
-                    for (name, b) in dep.date_links() {
-                        entries.push((name.into(), Key::DateLink(b), FileType::Symlink));
-                    }
-                }
-            }
-            Key::Version(b) | Key::Node(b, _) => {
-                let m = match self.manifest(b) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!("readdir: {e}");
-                        reply.error(errno(&e));
-                        return;
-                    }
-                };
-                let Some(dir) = self.node_index(key, &m) else {
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                };
-                if !m.node(dir).is_some_and(Node::is_dir) {
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                }
-                for c in m.children(dir) {
-                    let kind = if m.node(c).is_some_and(Node::is_dir) {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.push((
-                        OsString::from_vec(m.name(c).to_vec()),
-                        self.node_key(b, &m, c),
-                        kind,
-                    ));
-                }
-            }
-            Key::Latest(_) | Key::DateLink(_) => {
-                reply.error(Errno::ENOTDIR);
+        let entries = match self.dir_list(ino, fh) {
+            Ok(e) => e,
+            Err(e) => {
+                reply.error(e);
                 return;
             }
-        }
-        for (i, (name, k, kind)) in entries.into_iter().enumerate().skip(offset as usize) {
-            let ino = self.ino(k);
-            if reply.add(INodeNo(ino), i as u64 + 1, kind, &name) {
+        };
+        for (i, (name, key, kind)) in entries.iter().enumerate().skip(offset as usize) {
+            let ino = self.ino(*key);
+            if reply.add(INodeNo(ino), i as u64 + 1, *kind, name) {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: fuser::ReplyDirectoryPlus,
+    ) {
+        let entries = match self.dir_list(ino, fh) {
+            Ok(e) => e,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        for (i, (name, key, kind)) in entries.iter().enumerate().skip(offset as usize) {
+            let ino = self.ino(*key);
+            // An entry we listed should always have attributes; if it does
+            // not, still show the name rather than dropping it from the
+            // listing, and let a later stat report the error.
+            let attr = self
+                .attr_for(*key)
+                .unwrap_or_else(|_| self.attr(ino, *kind, 0, UNIX_EPOCH));
+            if reply.add(
+                INodeNo(ino),
+                i as u64 + 1,
+                name,
+                &TTL,
+                &attr,
+                Generation(0),
+            ) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: fuser::ReplyEmpty,
+    ) {
+        self.dirs.lock().open.remove(&fh.0);
         reply.ok();
     }
 
@@ -545,6 +624,14 @@ impl Filesystem for Steam2Fs {
             return;
         };
         let wanted = name.to_string_lossy();
+        // The kernel and tools ask for attributes in other namespaces
+        // constantly (security.*, system.*); answering those without first
+        // building every attribute we do serve saves parsing a blob and
+        // building a file table per call.
+        if !wanted.starts_with("user.steam2.") {
+            reply.error(Errno::ENODATA);
+            return;
+        }
         match self.xattrs(key).into_iter().find(|(n, _)| *n == wanted) {
             Some((_, v)) => {
                 if size == 0 {
@@ -597,17 +684,6 @@ impl Filesystem for Steam2Fs {
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
-        reply: fuser::ReplyEmpty,
-    ) {
-        reply.ok();
-    }
-
-    fn releasedir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
