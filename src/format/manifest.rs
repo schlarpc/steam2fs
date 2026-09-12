@@ -17,8 +17,6 @@
 //! Only `parent` uses 0xffffffff as "none"; `first_child` and `next_sibling`
 //! use 0 (the root can never be a child or sibling).
 
-use std::collections::HashMap;
-
 use super::{malformed, u32_at, Result};
 
 pub const HEADER_SIZE: usize = 0x38;
@@ -93,8 +91,10 @@ pub struct Manifest {
     pub fingerprint: u32,
     nodes: Vec<Node>,
     string_table: Vec<u8>,
-    /// (parent index, name) -> child index, for O(1) lookups.
-    by_name: HashMap<(u32, Box<[u8]>), u32>,
+    /// Every node that has a parent, sorted by (parent, name), so a child
+    /// can be found by binary search against the string table - without a
+    /// second copy of every name, or an allocation per lookup.
+    by_name: Vec<u32>,
 }
 
 impl Manifest {
@@ -163,7 +163,7 @@ impl Manifest {
             fingerprint,
             nodes,
             string_table,
-            by_name: HashMap::new(),
+            by_name: Vec::new(),
         };
         for (i, n) in m.nodes.iter().enumerate() {
             if n.name_offset as usize >= m.string_table.len() {
@@ -184,13 +184,10 @@ impl Manifest {
                 }
             }
         }
-        let mut by_name = HashMap::with_capacity(m.nodes.len());
-        for i in 0..m.nodes.len() {
-            let n = m.nodes[i];
-            if n.parent != NO_NODE {
-                by_name.insert((n.parent, m.name(i as u32).into()), i as u32);
-            }
-        }
+        let mut by_name: Vec<u32> = (0..m.nodes.len() as u32)
+            .filter(|i| m.nodes[*i as usize].parent != NO_NODE)
+            .collect();
+        by_name.sort_by(|a, b| m.sort_key(*a).cmp(&m.sort_key(*b)));
         m.by_name = by_name;
         Ok(m)
     }
@@ -233,8 +230,19 @@ impl Manifest {
         }
     }
 
+    fn sort_key(&self, idx: u32) -> (u32, &[u8]) {
+        (
+            self.nodes.get(idx as usize).map_or(NO_NODE, |n| n.parent),
+            self.name(idx),
+        )
+    }
+
     pub fn child_by_name(&self, dir: u32, name: &[u8]) -> Option<u32> {
-        self.by_name.get(&(dir, Box::from(name))).copied()
+        let i = self
+            .by_name
+            .binary_search_by(|idx| self.sort_key(*idx).cmp(&(dir, name)))
+            .ok()?;
+        self.by_name.get(i).copied()
     }
 
     /// Full path of a node, `/`-joined, without a leading slash.
@@ -366,6 +374,25 @@ mod tests {
         // 0 and NO_NODE are terminators, not indices.
         assert!(Manifest::parse(&with_node_field(2, 5, 0)).is_ok());
         assert!(Manifest::parse(&with_node_field(2, 5, NO_NODE)).is_ok());
+    }
+
+    #[test]
+    fn finds_every_child_by_name() {
+        let m = Manifest::parse(&sample()).unwrap();
+        for (i, n) in m.nodes().iter().enumerate() {
+            if n.parent == NO_NODE {
+                continue;
+            }
+            assert_eq!(
+                m.child_by_name(n.parent, m.name(i as u32)),
+                Some(i as u32),
+                "node {i}"
+            );
+        }
+        assert_eq!(m.child_by_name(0, b"nope"), None);
+        assert_eq!(m.child_by_name(99, b"a"), None);
+        // A name that exists, but under a different parent.
+        assert_eq!(m.child_by_name(0, b"x"), None);
     }
 
     #[test]
