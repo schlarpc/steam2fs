@@ -1,9 +1,10 @@
 # steam2fs
 
-A read-only FUSE filesystem that shows every version of every depot in a
-Steam2 content-server dump, straight from the archive's `blob` and `dat`
-files. Nothing is extracted; file bytes are decoded on demand from the
-32 KiB blocks the format is stored in.
+A read-only filesystem that shows every version of every depot in a Steam2
+content-server dump, straight from the archive's `blob` and `dat` files.
+Nothing is extracted; file bytes are decoded on demand from the 32 KiB
+blocks the format is stored in. It mounts through FUSE on Linux and through
+[WinFsp](https://github.com/winfsp/winfsp) on Windows.
 
 ```text
 /                              one directory per depot id
@@ -24,7 +25,10 @@ dat and offset.
 # local copy of the dump
 steam2fs mount /path/to/steam2 /mnt/steam2
 
-# over ssh, using your ~/.ssh/config and agent
+# on Windows, a drive letter (or a directory path)
+steam2fs mount D:\dumps\steam2 R:
+
+# over ssh, using your ~/.ssh/config, agent and known_hosts
 steam2fs mount example-host:/srv/dumps/steam2 /mnt/steam2
 
 # what is known about a depot, one version, or every file's location
@@ -37,9 +41,29 @@ steam2fs verify SOURCE 0 56
 
 The source must contain `blobs/` and `dats/`; `blobs_dates.txt` is used for
 dates when present. Sources are a local directory, `host:/path`, or
-`sftp://[user@]host[:port]/path`.
+`sftp://[user@]host[:port]/path`. SSH is spoken directly rather than through
+the `ssh` binary, so it works the same on Windows: `~/.ssh/config` is read
+for the host (`HostName`, `Port`, `User`, `IdentityFile`, `ProxyCommand`),
+the agent is used when one is running (`SSH_AUTH_SOCK`, or the OpenSSH pipe
+or Pageant on Windows), and host keys are checked against `known_hosts` —
+an unknown host is accepted with a warning, a changed key is refused.
 
-Unmount with `fusermount3 -u /mnt/steam2`.
+Unmount with `fusermount3 -u /mnt/steam2`, or Ctrl-C on Windows.
+
+### On Windows
+
+Mounting needs [WinFsp](https://github.com/winfsp/winfsp/releases) 2.1 or
+newer installed; the DLL is delay-loaded, so `inspect`, `verify` and
+`key-audit` work without it. Two things differ from the FUSE mount, because
+Windows has no good equivalent:
+
+- `latest` and the `by-date` entries are directories showing the version
+  they point at, not symlinks.
+- The `user.steam2.*` extended attributes are not served. `steam2fs inspect`
+  prints the same facts.
+
+Name lookups are case-insensitive there, as Windows programs expect, while
+listings keep each name exactly as the manifest spells it.
 
 ### Options
 
@@ -108,3 +132,28 @@ header word.
 Nix flake with a pinned toolchain; `direnv allow` or `nix develop`, then the
 usual `cargo build`, `cargo test`, `cargo clippy --all-targets`.
 Mounting only needs `fusermount3` on the host (no libfuse link).
+
+`nix build .#windows` cross-compiles the Windows binary (MSVC target, xwin
+CRT/SDK, `lld-link`); `cargo xwin build --release --target
+x86_64-pc-windows-msvc` does the same from the dev shell.
+
+## Licensing
+
+steam2fs is licensed under the GNU Lesser General Public License, version 3
+or later ([LICENSE](LICENSE), with the GPL text it refers to in
+[LICENSE.GPL-3.0](LICENSE.GPL-3.0)).
+
+Windows builds link WinFsp. WinFsp is GPLv3 with a FLOSS exception that
+permits linking its DLL from free software, and this notice is part of
+satisfying it:
+
+> WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+> <https://github.com/winfsp/winfsp>
+
+The Rust bindings used to reach it ([winfsp-rs](https://github.com/SnowflakePowered/winfsp-rs))
+are themselves GPL-3.0, so a *distributed Windows binary* carries GPLv3
+terms even though this project's own source stays LGPL. Unix builds link
+neither.
+
+The built-in depot key table comes from the extractor source distributed
+with TeraRelease, which stated no license of its own.

@@ -2,10 +2,10 @@
 name = "steam2fs"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "Time-travelling read-only FUSE filesystem over Steam2 content-server blob/dat dumps"
+license = "LGPL-3.0-or-later"
+description = "Time-travelling read-only filesystem over Steam2 content-server blob/dat dumps (FUSE and WinFsp)"
 readme = "README.md"
-keywords = ["fuse", "steam", "archive"]
+keywords = ["fuse", "winfsp", "steam", "archive"]
 categories = ["command-line-utilities", "filesystem"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
