@@ -5,13 +5,6 @@
 //! and `<depot>_<version>_<crc32 hex>_<sha256 hex>.dat`; a qBittorrent
 //! download in progress carries a trailing `.!qB`.
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -158,19 +151,19 @@ pub fn parse_date(s: &str) -> Option<SystemTime> {
         let n: u32 = f.parse().ok()?;
         n * 10u32.pow(9 - f.len() as u32)
     };
-    let days = days_from_civil(y, m, day);
-    if days < 0 {
-        return None;
-    }
-    let secs = days as u64 * 86_400 + h * 3600 + mi * 60 + sec;
+    // Dates before 1970 have no SystemTime to offset from here.
+    let days = u64::try_from(days_from_civil(y, m, day)).ok()?;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec;
     Some(UNIX_EPOCH + Duration::new(secs, nanos))
 }
 
 /// `YYYY-MM-DDTHH-MM-SS` for a unix timestamp (UTC).
 pub fn format_stamp(secs: u64) -> String {
-    let days = secs / 86_400;
+    // Saturating is unreachable for any real timestamp: i64 days is
+    // twenty-five billion years.
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
     let rem = secs % 86_400;
-    let (y, m, d) = civil_from_days(days as i64);
+    let (y, m, d) = civil_from_days(days);
     format!(
         "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}",
         rem / 3600,
@@ -180,6 +173,9 @@ pub fn format_stamp(secs: u64) -> String {
 }
 
 /// The inverse of `days_from_civil` (Howard Hinnant).
+// `doy` is a day of the year and `mp` a shifted month, both non-negative by
+// construction, so the day and month fall in 1..=31 and 1..=12.
+#[allow(clippy::cast_sign_loss)]
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

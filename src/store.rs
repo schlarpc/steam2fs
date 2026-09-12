@@ -2,13 +2,6 @@
 //! cache), follows version chains, builds per-version file tables, and
 //! serves decoded file bytes out of dats through two LRU caches.
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;

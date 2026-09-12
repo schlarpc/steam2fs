@@ -22,13 +22,6 @@
 //! Keys in the content-server blobs are little-endian `u32`s stored as raw
 //! bytes; nested values are themselves blobs.
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use std::io::Read;
 
 use super::{malformed, u16_at, u32_at, u64_at, Result};
