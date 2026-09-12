@@ -192,13 +192,13 @@ fn inspect(store: &Store, depot: u32, version: Option<String>, files: bool) -> a
         }
     );
     let Some(version) = version else {
-        for (name, b) in dep.version_names() {
-            let e = idx.blob(*b);
+        for (name, b) in dep.versions() {
+            let e = idx.blob(b);
             let date = e
                 .date
                 .and_then(|d| d.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or("-".into(), |d| fs::format_stamp(d.as_secs()));
-            let dat = store.parsed(*b).ok().map(|p| {
+                .map_or("-".into(), |d| index::format_stamp(d.as_secs()));
+            let dat = store.parsed(b).ok().map(|p| {
                 match idx.find_dat(depot, e.version, p.meta.dat_crc) {
                     Some(d) => {
                         let de = idx.dat(d);
