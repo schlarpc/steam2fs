@@ -322,7 +322,7 @@ fn verify(store: &Arc<Store>, depot: u32, version: &str, jobs: usize) -> anyhow:
                     for b in 0..loc.record.num_blocks() {
                         blocks.fetch_add(1, Ordering::Relaxed);
                         if let Err(e) = store.block(loc, b) {
-                            report.lock().push((node, format!("FAIL  {path}: {e}")));
+                            report.lock().push((node, format!("FAIL  {path}: {e:#}")));
                             break;
                         }
                     }
@@ -409,7 +409,7 @@ fn key_audit(
                     Err(e) => {
                         report
                             .lock()
-                            .push(format!("UNREADABLE {}: {e}", entry.file_name));
+                            .push(format!("UNREADABLE {}: {e:#}", entry.file_name));
                         counts.unreadable.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -440,7 +440,7 @@ fn key_audit(
                         counts.unreadable.fetch_add(1, Ordering::Relaxed);
                         report
                             .lock()
-                            .push(format!("UNREADABLE {}: {e}", entry.file_name));
+                            .push(format!("UNREADABLE {}: {e:#}", entry.file_name));
                     }
                 }
                 let done = i + 1;
