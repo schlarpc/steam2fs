@@ -213,8 +213,10 @@ impl Store {
 
     // ---- blobs -----------------------------------------------------------
 
-    /// Raw bytes of a blob, via the on-disk cache when configured. Blob file
-    /// names embed a sha256 of the contents, so the cache never goes stale.
+    /// Raw bytes of a blob, via the on-disk cache when configured. A blob's
+    /// name embeds the sha256 of its contents, so a cache entry is keyed by
+    /// what it should contain and is checked against it on the way out; a
+    /// name without a full hash falls back to a size check.
     pub fn blob_bytes(&self, id: BlobId) -> anyhow::Result<Vec<u8>> {
         let entry = self.index.blob(id);
         let cached = self
@@ -224,20 +226,17 @@ impl Store {
             .map(|d| d.join(&entry.file_name));
         if let Some(p) = &cached {
             if let Ok(bytes) = std::fs::read(p) {
-                if bytes.len() as u64 == entry.size {
-                    return Ok(bytes);
+                match check_contents(entry, &bytes) {
+                    Ok(()) => return Ok(bytes),
+                    Err(e) => tracing::warn!(
+                        path = %p.display(),
+                        "ignoring cached blob: {e:#}"
+                    ),
                 }
             }
         }
         let bytes = self.backend.read_all(&entry.path)?;
-        if let Some(expected) = entry.sha256.as_deref() {
-            let actual = hex::encode(sha2::Sha256::digest(&bytes));
-            anyhow::ensure!(
-                actual == expected,
-                "{}: sha256 {actual} does not match its name",
-                entry.file_name
-            );
-        }
+        check_contents(entry, &bytes)?;
         if let Some(p) = &cached {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -663,6 +662,29 @@ impl Store {
     pub fn cache_stats(&self) -> (usize, usize) {
         (self.raw.bytes(), self.blocks.bytes())
     }
+}
+
+/// Check bytes against what a blob's file name says they should be: its
+/// sha256 when the name carries the full hash, its size otherwise.
+fn check_contents(entry: &crate::index::BlobEntry, bytes: &[u8]) -> anyhow::Result<()> {
+    match entry.sha256.as_deref() {
+        Some(expected) => {
+            let actual = hex::encode(sha2::Sha256::digest(bytes));
+            anyhow::ensure!(
+                actual == expected,
+                "{}: sha256 {actual} does not match its name",
+                entry.file_name
+            );
+        }
+        None => anyhow::ensure!(
+            bytes.len() as u64 == entry.size,
+            "{}: {} bytes, expected {}",
+            entry.file_name,
+            bytes.len(),
+            entry.size
+        ),
+    }
+    Ok(())
 }
 
 pub fn parse_blob(bytes: &[u8]) -> anyhow::Result<ParsedBlob> {
