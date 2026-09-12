@@ -38,13 +38,26 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 
 ## Architecture
 
-Built from the [rust-flake](https://github.com/schlarpc/rust-flake) template.
+Read-only FUSE filesystem over a Steam2 content-server dump (`blobs/` + `dats/`), see README.md.
 
-- **src/main.rs** — application entry point
-- **Cargo.toml** — package manifest; lints configured under `[lints.rust]` and `[lints.clippy]`
-- **flake.nix** — Nix build (Crane), dev shell, and CI checks
-- **rust-toolchain.toml** — single source of truth for the Rust version; Nix reads it via
-  `rust-bin.fromRustupToolchainFile`, so builds stay reproducible. Bump `channel` to upgrade.
+- **src/main.rs** — clap CLI: `mount`, `inspect`, `verify`, `key-audit`; builds the `Store`
+- **src/backend/** — `Backend` trait (list dir, read range); `local.rs`, `sftp.rs` (system `ssh`
+  via the `openssh` crate; listing uses a remote `find`, reads use sftp)
+- **src/index.rs** — inventory from file names only; version-directory naming; `blobs_dates.txt`
+- **src/format/** — parsers: `blob.rs` (key/value container), `manifest.rs` (directory tree),
+  `checksums.rs` (per-file block table), `chunk.rs` (block decode + checksum)
+- **src/store.rs** — blob fetch + on-disk cache, parent chain, per-version file tables, dat reads
+  through raw-window and decoded-block LRU caches
+- **src/fs.rs** — `fuser::Filesystem` impl; inode interning; symlinks; xattrs
+- **src/keys/table.rs** — generated depot key table (from the original extractor's `keys.cpp`)
+
+Format facts worth knowing: manifest child/sibling links end at 0, not 0xffffffff; a compressed
+blob's `packed_size` includes its 20-byte header; block checksum is adler32 seeded with 0 XOR crc32;
+blob key 10 is crc32 of the blob with that field zeroed; blob key 2 equals the manifest fingerprint;
+a changed file gets a new file id (blob keys 5/6 are per-version add/remove id lists).
+
+Test data: `../samples/dump` holds a few real blobs/dats (symlinks) for `inspect`/`verify`/mount
+tests; `verify` on depot 0 version 2 must report 0 failures.
 
 ## Keeping in sync with the base template
 
