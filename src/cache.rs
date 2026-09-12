@@ -133,7 +133,11 @@ mod tests {
             }
         });
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        assert_eq!(flight.tracked(), 0, "keys are dropped once nobody holds them");
+        assert_eq!(
+            flight.tracked(),
+            0,
+            "keys are dropped once nobody holds them"
+        );
     }
 
     #[test]

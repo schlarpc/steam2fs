@@ -491,7 +491,11 @@ impl Filesystem for Steam2Fs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let entries = match self.key(ino).ok_or(Errno::ENOENT).and_then(|k| self.dir_entries(k)) {
+        let entries = match self
+            .key(ino)
+            .ok_or(Errno::ENOENT)
+            .and_then(|k| self.dir_entries(k))
+        {
             Ok(e) => Arc::new(e),
             Err(e) => {
                 reply.error(e);
@@ -552,14 +556,7 @@ impl Filesystem for Steam2Fs {
             let attr = self
                 .attr_for(*key)
                 .unwrap_or_else(|_| self.attr(ino, *kind, 0, UNIX_EPOCH));
-            if reply.add(
-                INodeNo(ino),
-                i as u64 + 1,
-                name,
-                &TTL,
-                &attr,
-                Generation(0),
-            ) {
+            if reply.add(INodeNo(ino), i as u64 + 1, name, &TTL, &attr, Generation(0)) {
                 break;
             }
         }
