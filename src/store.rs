@@ -679,7 +679,8 @@ pub fn parse_blob(bytes: &[u8]) -> anyhow::Result<ParsedBlob> {
     );
     // Key 10 is the crc32 of the whole blob with its own value zeroed.
     let own = top.require(blob::keys::OWN_CRC)?;
-    let off = own.as_ptr() as usize - bytes.as_ptr() as usize;
+    anyhow::ensure!(own.len() == 4, "key 10 is {} bytes, not 4", own.len());
+    let off = top.value_offset(blob::keys::OWN_CRC)?;
     let mut h = crc32fast::Hasher::new();
     h.update(&bytes[..off]);
     h.update(&[0u8; 4]);
