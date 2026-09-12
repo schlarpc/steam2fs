@@ -13,6 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: DeterminateSystems/nix-installer-action@v22
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
       - run: nix build
       - run: nix flake check
