@@ -8,13 +8,6 @@
 //! /<depot>/by-date/<timestamp>_<version> -> ../<version>
 //! ```
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

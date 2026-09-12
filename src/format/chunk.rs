@@ -8,13 +8,6 @@
 //!
 //! Each block's checksum is `adler32(seed 0) ^ crc32` of the decoded bytes.
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use std::io::Read;
 
 use aes::cipher::KeyIvInit;

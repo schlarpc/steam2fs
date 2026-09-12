@@ -17,13 +17,6 @@
 //! Only `parent` uses 0xffffffff as "none"; `first_child` and `next_sibling`
 //! use 0 (the root can never be a child or sibling).
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use std::collections::HashMap;
 
 use super::{malformed, u32_at, Result};

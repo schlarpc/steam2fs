@@ -16,13 +16,6 @@
 //! Every file listed here is stored, whole, in this version's dat at
 //! `offset`, as consecutive blocks of `BLOCK_SIZE` decompressed bytes.
 
-// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-
 use super::{malformed, u32_at, u64_at, Result, BLOCK_SIZE};
 
 pub const MAGIC: u32 = 0x3445_7234;
