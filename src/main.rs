@@ -102,6 +102,9 @@ enum Command {
         source: SourceArgs,
         depot: u32,
         version: String,
+        /// Parallel workers.
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
     },
     /// Check which encrypted blobs the known keys actually decrypt, trying
     /// every key where the depot's own fails. Writes discovered keys as
@@ -285,32 +288,59 @@ fn inspect(store: &Store, depot: u32, version: Option<String>, files: bool) -> a
     Ok(())
 }
 
-fn verify(store: &Store, depot: u32, version: &str) -> anyhow::Result<()> {
+fn verify(store: &Arc<Store>, depot: u32, version: &str, jobs: usize) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let id = resolve_version(store, depot, version)?;
     let table = store.table(id)?;
     let m = store.parsed(id)?.manifest.clone();
-    let (mut files, mut blocks, mut failed) = (0usize, 0usize, 0usize);
-    for (i, n) in m.nodes().iter().enumerate() {
-        if n.is_dir() {
-            continue;
+    let file_nodes: Vec<u32> = m
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| !n.is_dir())
+        .map(|(i, _)| i as u32)
+        .collect();
+
+    let next = AtomicUsize::new(0);
+    let blocks = AtomicUsize::new(0);
+    // Keyed by node index so the report reads in tree order whatever order
+    // the workers finish in.
+    let report = parking_lot::Mutex::new(Vec::<(u32, String)>::new());
+
+    std::thread::scope(|s| {
+        for _ in 0..jobs.max(1) {
+            s.spawn(|| {
+                while let Some(&node) = file_nodes.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let path = String::from_utf8_lossy(&m.path(node)).into_owned();
+                    let file_id = m.node(node).map_or(u32::MAX, |n| n.file_id);
+                    let Some(loc) = table.get(file_id) else {
+                        report.lock().push((node, format!("NO RECORD  {path}")));
+                        continue;
+                    };
+                    for b in 0..loc.record.num_blocks() {
+                        blocks.fetch_add(1, Ordering::Relaxed);
+                        if let Err(e) = store.block(loc, b) {
+                            report.lock().push((node, format!("FAIL  {path}: {e}")));
+                            break;
+                        }
+                    }
+                }
+            });
         }
-        files += 1;
-        let path = String::from_utf8_lossy(&m.path(i as u32)).into_owned();
-        let Some(loc) = table.get(n.file_id) else {
-            println!("NO RECORD  {path}");
-            failed += 1;
-            continue;
-        };
-        for b in 0..loc.record.num_blocks() {
-            blocks += 1;
-            if let Err(e) = store.block(loc, b) {
-                println!("FAIL  {path}: {e}");
-                failed += 1;
-                break;
-            }
-        }
+    });
+
+    let mut lines = report.into_inner();
+    lines.sort_by_key(|(node, _)| *node);
+    for (_, l) in &lines {
+        println!("{l}");
     }
-    println!("{files} files, {blocks} blocks read, {failed} failures");
+    let failed = lines.len();
+    println!(
+        "{} files, {} blocks read, {failed} failures",
+        file_nodes.len(),
+        blocks.load(Ordering::Relaxed)
+    );
     anyhow::ensure!(failed == 0, "{failed} files failed verification");
     Ok(())
 }
@@ -493,9 +523,10 @@ fn main() -> anyhow::Result<()> {
             source,
             depot,
             version,
+            jobs,
         } => {
             let store = open_store(&source)?;
-            verify(&store, depot, &version)
+            verify(&store, depot, &version, jobs)
         }
         Command::KeyAudit {
             source,
