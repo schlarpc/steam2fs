@@ -91,6 +91,21 @@ pub fn decode(mode: Mode, raw: &[u8], key: Option<&Key>) -> Result<Vec<u8>> {
     }
 }
 
+/// Decode a block whose stored bytes we own. Plain and encrypted blocks
+/// are the same length decoded, so they need no second buffer.
+pub fn decode_owned(mode: Mode, raw: Vec<u8>, key: Option<&Key>) -> Result<Vec<u8>> {
+    match mode {
+        Mode::Plain => Ok(raw),
+        Mode::Encrypted => {
+            let key = key.ok_or_else(|| malformed("encrypted block but no depot key"))?;
+            let mut buf = raw;
+            decrypt(key, &mut buf);
+            Ok(buf)
+        }
+        Mode::Compressed | Mode::CompressedEncrypted => decode(mode, &raw, key),
+    }
+}
+
 /// Decode and check a block against its stored checksum in one step.
 pub fn decode_verified(
     mode: Mode,
@@ -139,5 +154,18 @@ mod tests {
     #[test]
     fn encrypted_requires_key() {
         assert!(decode(Mode::Encrypted, &[0u8; 16], None).is_err());
+        assert!(decode_owned(Mode::Encrypted, vec![0u8; 16], None).is_err());
+    }
+
+    #[test]
+    fn decode_owned_matches_decode() {
+        let payload = vec![7u8; 1000];
+        let key = [3u8; 16];
+        for mode in [Mode::Plain, Mode::Encrypted] {
+            assert_eq!(
+                decode_owned(mode, payload.clone(), Some(&key)).unwrap(),
+                decode(mode, &payload, Some(&key)).unwrap()
+            );
+        }
     }
 }
