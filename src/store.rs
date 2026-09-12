@@ -69,18 +69,32 @@ pub enum ReadError {
     Other(#[from] anyhow::Error),
 }
 
+/// What a read failure means to a filesystem frontend, before it is turned
+/// into an errno or an NTSTATUS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The bytes are not in this dump at all (no record, or a missing dat).
+    Missing,
+    /// Encrypted with a key we do not have.
+    NoKey,
+    /// The bytes are here but did not survive the trip.
+    Io,
+    /// The metadata did not parse.
+    BadData,
+}
+
 impl ReadError {
-    pub fn errno(&self) -> i32 {
+    pub fn class(&self) -> ErrorClass {
         match self {
-            ReadError::MissingRecord(_) | ReadError::MissingDat { .. } => libc::ENXIO,
-            ReadError::NoKey(_) | ReadError::NoWorkingKey { .. } => libc::ENOKEY,
+            ReadError::MissingRecord(_) | ReadError::MissingDat { .. } => ErrorClass::Missing,
+            ReadError::NoKey(_) | ReadError::NoWorkingKey { .. } => ErrorClass::NoKey,
             ReadError::Checksum { .. }
             | ReadError::ShortRead { .. }
             | ReadError::NoSuchBlock { .. }
             | ReadError::BlockSize { .. }
-            | ReadError::NoBlocksToProbe { .. } => libc::EIO,
-            ReadError::Format(_) => libc::EBADMSG,
-            ReadError::Other(_) => libc::EIO,
+            | ReadError::NoBlocksToProbe { .. } => ErrorClass::Io,
+            ReadError::Format(_) => ErrorClass::BadData,
+            ReadError::Other(_) => ErrorClass::Io,
         }
     }
 }

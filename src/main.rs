@@ -12,6 +12,7 @@ mod fs;
 mod index;
 mod keys;
 mod store;
+mod tree;
 
 use std::path::PathBuf;
 use std::sync::Arc;
