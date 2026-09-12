@@ -1,0 +1,15 @@
+{
+  "template": "https://github.com/schlarpc/rust-flake",
+  "commit": "f764556d5192d276d08d06fc4651b559a1bd201b",
+  "checkout": "template",
+  "context": {
+    "cookiecutter": {
+      "project_name": "steam2fs",
+      "_template": "https://github.com/schlarpc/rust-flake",
+      "_output_dir": "/home/schlarpc/steam2-extractor",
+      "_repo_dir": "/home/schlarpc/.cookiecutters/rust-flake",
+      "_checkout": "template"
+    }
+  },
+  "directory": null
+}
