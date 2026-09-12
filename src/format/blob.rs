@@ -69,10 +69,19 @@ pub mod keys {
     pub const DAT_SIZE: u32 = 13;
 }
 
+/// One key/value pair, with where its value sits in the parsed buffer.
+#[derive(Debug, Clone, Copy)]
+struct Entry<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+    /// Offset of `value` from the start of the buffer `parse` was given.
+    value_offset: usize,
+}
+
 /// A parsed view over a plain blob's entries.
 #[derive(Debug, Clone)]
 pub struct Blob<'a> {
-    entries: Vec<(&'a [u8], &'a [u8])>,
+    entries: Vec<Entry<'a>>,
 }
 
 impl<'a> Blob<'a> {
@@ -98,10 +107,15 @@ impl<'a> Blob<'a> {
             let key = data
                 .get(pos..pos + klen)
                 .ok_or_else(|| malformed("blob key truncated"))?;
+            let value_offset = pos + klen;
             let value = data
-                .get(pos + klen..pos + klen + vlen)
+                .get(value_offset..value_offset + vlen)
                 .ok_or_else(|| malformed("blob value truncated"))?;
-            entries.push((key, value));
+            entries.push(Entry {
+                key,
+                value,
+                value_offset,
+            });
             pos += klen + vlen;
         }
         Ok(Self { entries })
@@ -121,15 +135,24 @@ impl<'a> Blob<'a> {
     }
 
     #[allow(dead_code)]
-    pub fn entries(&self) -> &[(&'a [u8], &'a [u8])] {
-        &self.entries
+    pub fn entries(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + '_ {
+        self.entries.iter().map(|e| (e.key, e.value))
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&'a [u8]> {
+        self.entries.iter().find(|e| e.key == key).map(|e| e.value)
+    }
+
+    /// Offset of a key's value within the buffer this blob was parsed from.
+    /// Key 10 holds the blob's own crc32, which has to be recomputed with
+    /// those four bytes zeroed.
+    pub fn value_offset(&self, key: u32) -> Result<usize> {
+        let k = key.to_le_bytes();
         self.entries
             .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| *v)
+            .find(|e| e.key == k)
+            .map(|e| e.value_offset)
+            .ok_or_else(|| malformed(format!("blob is missing key {key}")))
     }
 
     pub fn get_u32_key(&self, key: u32) -> Option<&'a [u8]> {
