@@ -249,13 +249,13 @@ fn inspect(store: &Store, depot: u32, version: Option<String>, files: bool) -> a
     let located = m
         .nodes()
         .iter()
-        .filter(|n| !n.is_dir() && table.contains_key(&n.file_id))
+        .filter(|n| !n.is_dir() && table.contains(n.file_id))
         .count();
     let readable = m
         .nodes()
         .iter()
         .filter(|n| !n.is_dir())
-        .filter(|n| table.get(&n.file_id).is_some_and(|l| l.dat.is_some()))
+        .filter(|n| table.get(n.file_id).is_some_and(|l| l.dat.is_some()))
         .count();
     println!("version {version}: {file_nodes} files, {located} with records, {readable} with a dat present");
     if files {
@@ -264,7 +264,7 @@ fn inspect(store: &Store, depot: u32, version: Option<String>, files: bool) -> a
                 continue;
             }
             let path = String::from_utf8_lossy(&m.path(i as u32)).into_owned();
-            match table.get(&n.file_id) {
+            match table.get(n.file_id) {
                 Some(loc) => println!(
                     "  {path}  id {} {:?} {} bytes, {} blocks, from v{} {}",
                     n.file_id,
@@ -296,7 +296,7 @@ fn verify(store: &Store, depot: u32, version: &str) -> anyhow::Result<()> {
         }
         files += 1;
         let path = String::from_utf8_lossy(&m.path(i as u32)).into_owned();
-        let Some(loc) = table.get(&n.file_id) else {
+        let Some(loc) = table.get(n.file_id) else {
             println!("NO RECORD  {path}");
             failed += 1;
             continue;

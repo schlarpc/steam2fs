@@ -92,7 +92,32 @@ pub struct FileLoc {
     pub offsets: Vec<u64>,
 }
 
-pub type FileTable = HashMap<u32, Arc<FileLoc>>;
+/// A version's file table, stored as the records that version introduced
+/// layered over its parent's table. Building it costs only this version's
+/// records, and two versions of a depot share everything they inherit.
+pub struct FileTable {
+    /// Records this version introduced, by file id.
+    own: HashMap<u32, Arc<FileLoc>>,
+    /// The parent version's table; the chain is acyclic by construction
+    /// (`chain` breaks cycles), so lookups always terminate.
+    parent: Option<Arc<FileTable>>,
+}
+
+impl FileTable {
+    pub fn get(&self, file_id: u32) -> Option<&Arc<FileLoc>> {
+        let mut cur = self;
+        loop {
+            if let Some(loc) = cur.own.get(&file_id) {
+                return Some(loc);
+            }
+            cur = cur.parent.as_deref()?;
+        }
+    }
+
+    pub fn contains(&self, file_id: u32) -> bool {
+        self.get(file_id).is_some()
+    }
+}
 
 pub struct StoreConfig {
     pub blob_cache_dir: Option<PathBuf>,
@@ -308,17 +333,32 @@ impl Store {
 
     // ---- file tables ------------------------------------------------------
 
-    /// File id -> location, as of version `id` (its own records overlaid on
-    /// its parent's table).
+    /// File id -> location, as of version `id`: the records it introduced
+    /// layered over its parent's table.
+    ///
+    /// Built by walking the version chain root-first rather than recursing,
+    /// so a dump whose blobs point at each other cannot overflow the stack.
     pub fn table(&self, id: BlobId) -> Result<Arc<FileTable>> {
         if let Some(t) = self.tables.lock().get(&id) {
             return Ok(t.clone());
         }
+        let mut parent: Option<Arc<FileTable>> = None;
+        for b in self.chain(id)? {
+            if let Some(t) = self.tables.lock().get(&b) {
+                parent = Some(t.clone());
+                continue;
+            }
+            let t = Arc::new(self.own_table(b, parent.take())?);
+            self.tables.lock().put(b, t.clone());
+            parent = Some(t);
+        }
+        // `chain` always ends at `id` itself, so the last layer is its table.
+        parent.ok_or_else(|| ReadError::Other(anyhow::anyhow!("empty version chain")))
+    }
+
+    /// One layer: the records blob `id` introduced, over `parent`.
+    fn own_table(&self, id: BlobId, parent: Option<Arc<FileTable>>) -> Result<FileTable> {
         let parsed = self.parsed(id)?;
-        let mut table: FileTable = match self.parent(id)? {
-            Some(p) => (*self.table(p)?).clone(),
-            None => HashMap::new(),
-        };
         let entry = self.index.blob(id);
         let dat = self
             .index
@@ -331,6 +371,7 @@ impl Store {
                 parsed.records.len()
             );
         }
+        let mut own = HashMap::with_capacity(parsed.records.len());
         for r in &parsed.records {
             let mut offsets = Vec::with_capacity(r.blocks.len() + 1);
             let mut off = r.offset;
@@ -339,7 +380,7 @@ impl Store {
                 off += u64::from(b.compressed_size);
                 offsets.push(off);
             }
-            table.insert(
+            own.insert(
                 r.file_id,
                 Arc::new(FileLoc {
                     source: id,
@@ -349,14 +390,12 @@ impl Store {
                 }),
             );
         }
-        let table = Arc::new(table);
-        self.tables.lock().put(id, table.clone());
-        Ok(table)
+        Ok(FileTable { own, parent })
     }
 
     pub fn locate(&self, id: BlobId, file_id: u32) -> Result<Arc<FileLoc>> {
         self.table(id)?
-            .get(&file_id)
+            .get(file_id)
             .cloned()
             .ok_or(ReadError::MissingRecord(file_id))
     }
