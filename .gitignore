@@ -38,3 +38,6 @@ htmlcov/
 # Local environment overrides (if any)
 .env.local
 .envrc.local
+
+# local FUSE mountpoint
+mntpt/
