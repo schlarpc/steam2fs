@@ -55,6 +55,21 @@ pub enum ReadError {
         want: usize,
         got: usize,
     },
+    #[error("file id {file_id} has no block {block} (it has {blocks})")]
+    NoSuchBlock {
+        file_id: u32,
+        block: usize,
+        blocks: usize,
+    },
+    #[error("block {block} of file id {file_id} decoded to {got} bytes, expected {want}")]
+    BlockSize {
+        file_id: u32,
+        block: usize,
+        want: u64,
+        got: usize,
+    },
+    #[error("file id {file_id} has no blocks, so its key cannot be probed")]
+    NoBlocksToProbe { file_id: u32 },
     #[error(transparent)]
     Format(#[from] crate::format::FormatError),
     #[error(transparent)]
@@ -66,7 +81,11 @@ impl ReadError {
         match self {
             ReadError::MissingRecord(_) | ReadError::MissingDat { .. } => libc::ENXIO,
             ReadError::NoKey(_) | ReadError::NoWorkingKey { .. } => libc::ENOKEY,
-            ReadError::Checksum { .. } | ReadError::ShortRead { .. } => libc::EIO,
+            ReadError::Checksum { .. }
+            | ReadError::ShortRead { .. }
+            | ReadError::NoSuchBlock { .. }
+            | ReadError::BlockSize { .. }
+            | ReadError::NoBlocksToProbe { .. } => libc::EIO,
             ReadError::Format(_) => libc::EBADMSG,
             ReadError::Other(_) => libc::EIO,
         }
@@ -90,6 +109,21 @@ pub struct FileLoc {
     pub record: FileRecord,
     /// Absolute dat offset of each block; `offsets[i+1]` is the end of block `i`.
     pub offsets: Vec<u64>,
+}
+
+impl FileLoc {
+    /// Stored byte range of block `i` in the dat.
+    fn block_span(&self, i: usize) -> Option<(u64, u64)> {
+        Some((*self.offsets.get(i)?, *self.offsets.get(i + 1)?))
+    }
+
+    fn no_such_block(&self, i: usize) -> ReadError {
+        ReadError::NoSuchBlock {
+            file_id: self.record.file_id,
+            block: i,
+            blocks: self.record.num_blocks(),
+        }
+    }
 }
 
 /// A version's file table, stored as the records that version introduced
@@ -497,19 +531,24 @@ impl Store {
     /// Resolve the key for an encrypted file by reading its first block.
     pub fn probe_key(&self, loc: &FileLoc) -> Result<KeyResolution> {
         let dat = loc.dat.ok_or_else(|| self.missing_dat(loc))?;
-        let raw = self.dat_bytes(dat, loc.offsets[0], loc.offsets[1])?;
-        if raw.len() as u64 != loc.offsets[1] - loc.offsets[0] {
+        // An empty file stores nothing, so there is no ciphertext to test a
+        // candidate key against.
+        let (Some(first), Some((start, end))) = (loc.record.blocks.first(), loc.block_span(0))
+        else {
+            return Err(ReadError::NoBlocksToProbe {
+                file_id: loc.record.file_id,
+            });
+        };
+        let raw = self.dat_bytes(dat, start, end)?;
+        if raw.len() as u64 != end - start {
             return Err(ReadError::ShortRead {
                 file_id: loc.record.file_id,
                 block: 0,
-                want: (loc.offsets[1] - loc.offsets[0]) as usize,
+                want: (end - start) as usize,
                 got: raw.len(),
             });
         }
-        Ok(self.resolve_key(
-            loc.source,
-            (loc.record.mode, &raw, loc.record.blocks[0].checksum),
-        ))
+        Ok(self.resolve_key(loc.source, (loc.record.mode, &raw, first.checksum)))
     }
 
     fn missing_dat(&self, loc: &FileLoc) -> ReadError {
@@ -531,8 +570,10 @@ impl Store {
                 crc: self.parsed(loc.source).map(|p| p.meta.dat_crc).unwrap_or(0),
             }
         })?;
-        let start = loc.offsets[i];
-        let end = loc.offsets[i + 1];
+        let (Some(block_meta), Some((start, end))) = (loc.record.blocks.get(i), loc.block_span(i))
+        else {
+            return Err(loc.no_such_block(i));
+        };
         let key = (dat, start);
         if let Some(b) = self.blocks.get(&key) {
             return Ok(b);
@@ -549,7 +590,7 @@ impl Store {
         }
         let entry = self.index.blob(loc.source);
         let key_bytes = if rec.mode.is_encrypted() {
-            match self.resolve_key(loc.source, (rec.mode, &raw, rec.blocks[i].checksum)) {
+            match self.resolve_key(loc.source, (rec.mode, &raw, block_meta.checksum)) {
                 KeyResolution::Configured(k) | KeyResolution::Discovered(k, _) => Some(k),
                 KeyResolution::None { tried: 0 } => return Err(ReadError::NoKey(entry.depot)),
                 KeyResolution::None { tried } => {
@@ -566,7 +607,7 @@ impl Store {
         let decoded = chunk::decode(rec.mode, &raw, key_bytes.as_ref())?;
         if self.cfg.verify {
             let actual = chunk::checksum(&decoded);
-            let expected = rec.blocks[i].checksum;
+            let expected = block_meta.checksum;
             if actual != expected {
                 return Err(ReadError::Checksum {
                     file_id: rec.file_id,
@@ -576,15 +617,16 @@ impl Store {
                 });
             }
         }
+        // The block table and the file size have to agree, or `read` would
+        // have to paper over a hole with silently truncated data.
         let (bs, be) = rec.block_range(i);
         if decoded.len() as u64 != be - bs {
-            tracing::debug!(
-                file_id = rec.file_id,
-                block = i,
-                "decoded {} bytes, expected {}",
-                decoded.len(),
-                be - bs
-            );
+            return Err(ReadError::BlockSize {
+                file_id: rec.file_id,
+                block: i,
+                want: be - bs,
+                got: decoded.len(),
+            });
         }
         let decoded = Arc::new(decoded);
         self.blocks.insert(key, decoded.clone());
@@ -601,14 +643,14 @@ impl Store {
         let mut out = Vec::with_capacity((end - offset) as usize);
         let mut pos = offset;
         while pos < end {
+            // Every byte below `size` is covered by a block, so a missing or
+            // short block is corruption, not end of file: report it rather
+            // than handing back a silently truncated read.
             let i = (pos / BLOCK_SIZE) as usize;
-            if i >= loc.record.num_blocks() {
-                break;
-            }
             let block = self.block(loc, i)?;
             let in_block = (pos % BLOCK_SIZE) as usize;
             if in_block >= block.len() {
-                break;
+                return Err(loc.no_such_block(i));
             }
             let take = ((end - pos) as usize).min(block.len() - in_block);
             out.extend_from_slice(&block[in_block..in_block + take]);
