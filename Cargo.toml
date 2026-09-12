@@ -3,15 +3,35 @@ name = "steam2fs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A Rust application built with Nix flakes"
+description = "Time-travelling read-only FUSE filesystem over Steam2 content-server blob/dat dumps"
 readme = "README.md"
-keywords = ["nix", "flake"]
-categories = ["command-line-utilities"]
+keywords = ["fuse", "steam", "archive"]
+categories = ["command-line-utilities", "filesystem"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# Production dependencies go here
+fuser = { version = "0.18", default-features = false }
+openssh = "0.11"
+openssh-sftp-client = { version = "0.15", features = ["openssh"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+aes = "0.9"
+cfb-mode = "0.9"
+crc32fast = "1.5"
+adler2 = "2"
+lru = "0.18"
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+futures-util = "0.3"
+libc = "0.2"
+hex = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Dev-only dependencies (tests, benchmarks) - these don't leak to production builds

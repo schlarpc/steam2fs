@@ -1,0 +1,618 @@
+//! Ties the pieces together: fetches and parses blobs (with an on-disk
+//! cache), follows version chains, builds per-version file tables, and
+//! serves decoded file bytes out of dats through two LRU caches.
+
+// Sizes and offsets in this format are 32-bit on disk; the casts below are bounded by it.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context;
+use parking_lot::Mutex;
+
+use crate::backend::Backend;
+use crate::cache::ByteLru;
+use crate::format::blob::{self, Blob, VersionMeta};
+use crate::format::checksums::{self, FileRecord};
+use crate::format::chunk::{self, Key};
+use crate::format::manifest::Manifest;
+use crate::format::BLOCK_SIZE;
+use crate::index::{BlobId, DatId, Index};
+use crate::keys::KeyStore;
+use sha2::Digest;
+
+/// Raw dat bytes are fetched in aligned windows this large.
+pub const RAW_WINDOW: u64 = 1 << 20;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    #[error("no file record for file id {0} in this version chain")]
+    MissingRecord(u32),
+    #[error("dat file for depot {depot} version {version} crc {crc:08x} is not in the dump")]
+    MissingDat { depot: u32, version: u32, crc: u32 },
+    #[error("no AES key known for depot {0}")]
+    NoKey(u32),
+    #[error("depot {depot} blob {crc:08x}: no known key decrypts it (tried {tried})")]
+    NoWorkingKey { depot: u32, crc: u32, tried: usize },
+    #[error("block {block} of file id {file_id}: checksum mismatch (expected {expected:08x}, got {actual:08x})")]
+    Checksum {
+        file_id: u32,
+        block: usize,
+        expected: u32,
+        actual: u32,
+    },
+    #[error("block {block} of file id {file_id}: short read from dat ({got} of {want} bytes)")]
+    ShortRead {
+        file_id: u32,
+        block: usize,
+        want: usize,
+        got: usize,
+    },
+    #[error(transparent)]
+    Format(#[from] crate::format::FormatError),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl ReadError {
+    pub fn errno(&self) -> i32 {
+        match self {
+            ReadError::MissingRecord(_) | ReadError::MissingDat { .. } => libc::ENXIO,
+            ReadError::NoKey(_) | ReadError::NoWorkingKey { .. } => libc::ENOKEY,
+            ReadError::Checksum { .. } | ReadError::ShortRead { .. } => libc::EIO,
+            ReadError::Format(_) => libc::EBADMSG,
+            ReadError::Other(_) => libc::EIO,
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, ReadError>;
+
+/// Everything parsed out of one version blob.
+pub struct ParsedBlob {
+    pub meta: VersionMeta,
+    pub manifest: Arc<Manifest>,
+    pub records: Vec<FileRecord>,
+}
+
+/// Where one file id's bytes live, as seen from some version.
+pub struct FileLoc {
+    /// The blob whose dat holds the data (the version that last changed it).
+    pub source: BlobId,
+    pub dat: Option<DatId>,
+    pub record: FileRecord,
+    /// Absolute dat offset of each block; `offsets[i+1]` is the end of block `i`.
+    pub offsets: Vec<u64>,
+}
+
+pub type FileTable = HashMap<u32, Arc<FileLoc>>;
+
+pub struct StoreConfig {
+    pub blob_cache_dir: Option<PathBuf>,
+    pub raw_cache_bytes: usize,
+    pub block_cache_bytes: usize,
+    pub verify: bool,
+    /// When the depot's key fails, try every known key against the block.
+    pub key_search: bool,
+}
+
+/// Outcome of resolving the key for one blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyResolution {
+    /// The configured key for the depot (or a blob-specific override) works.
+    Configured(Key),
+    /// Found by trying every known key; the u32 is the depot it belongs to.
+    Discovered(Key, u32),
+    /// Nothing decrypts this blob's data.
+    None { tried: usize },
+}
+
+pub struct Store {
+    backend: Arc<dyn Backend>,
+    pub index: Index,
+    keys: KeyStore,
+    cfg: StoreConfig,
+    parsed: Mutex<lru::LruCache<BlobId, Arc<ParsedBlob>>>,
+    tables: Mutex<lru::LruCache<BlobId, Arc<FileTable>>>,
+    raw: ByteLru<(DatId, u64)>,
+    blocks: ByteLru<(DatId, u64)>,
+    /// Per source blob: which key actually decrypts it (resolved lazily).
+    resolved_keys: Mutex<HashMap<BlobId, KeyResolution>>,
+}
+
+impl Store {
+    pub fn new(backend: Arc<dyn Backend>, index: Index, keys: KeyStore, cfg: StoreConfig) -> Self {
+        let cap = |n: usize| NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            raw: ByteLru::new(cfg.raw_cache_bytes),
+            blocks: ByteLru::new(cfg.block_cache_bytes),
+            backend,
+            index,
+            keys,
+            cfg,
+            parsed: Mutex::new(lru::LruCache::new(cap(512))),
+            tables: Mutex::new(lru::LruCache::new(cap(256))),
+            resolved_keys: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn backend(&self) -> &dyn Backend {
+        &*self.backend
+    }
+
+    pub fn key_for(&self, depot: u32) -> Option<Key> {
+        self.keys.get(depot)
+    }
+
+    // ---- blobs -----------------------------------------------------------
+
+    /// Raw bytes of a blob, via the on-disk cache when configured. Blob file
+    /// names embed a sha256 of the contents, so the cache never goes stale.
+    pub fn blob_bytes(&self, id: BlobId) -> anyhow::Result<Vec<u8>> {
+        let entry = self.index.blob(id);
+        let cached = self
+            .cfg
+            .blob_cache_dir
+            .as_ref()
+            .map(|d| d.join(&entry.file_name));
+        if let Some(p) = &cached {
+            if let Ok(bytes) = std::fs::read(p) {
+                if bytes.len() as u64 == entry.size {
+                    return Ok(bytes);
+                }
+            }
+        }
+        let bytes = self.backend.read_all(&entry.path)?;
+        if let Some(expected) = entry.sha256.as_deref() {
+            let actual = hex::encode(sha2::Sha256::digest(&bytes));
+            anyhow::ensure!(
+                actual == expected,
+                "{}: sha256 {actual} does not match its name",
+                entry.file_name
+            );
+        }
+        if let Some(p) = &cached {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = p.with_extension("blob.tmp");
+            if std::fs::write(&tmp, &bytes)
+                .and_then(|()| std::fs::rename(&tmp, p))
+                .is_err()
+            {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        Ok(bytes)
+    }
+
+    pub fn parsed(&self, id: BlobId) -> Result<Arc<ParsedBlob>> {
+        if let Some(p) = self.parsed.lock().get(&id) {
+            return Ok(p.clone());
+        }
+        let bytes = self.blob_bytes(id)?;
+        let entry = self.index.blob(id);
+        let parsed =
+            Arc::new(parse_blob(&bytes).with_context(|| format!("parsing {}", entry.file_name))?);
+        // Cross-checks between the pieces of a blob and its file name.
+        if parsed.meta.own_crc != entry.crc {
+            tracing::warn!(
+                blob = entry.file_name,
+                "blob key 10 {:08x} != name crc",
+                parsed.meta.own_crc
+            );
+        }
+        if parsed.manifest.version_id != entry.version {
+            tracing::warn!(
+                blob = entry.file_name,
+                "manifest version id {} != name",
+                parsed.manifest.version_id
+            );
+        }
+        let stored: u64 = parsed
+            .records
+            .iter()
+            .flat_map(|r| r.blocks.iter().map(|b| u64::from(b.compressed_size)))
+            .sum();
+        if stored != parsed.meta.dat_size {
+            tracing::warn!(
+                blob = entry.file_name,
+                "blocks total {stored} bytes but blob says the dat is {}",
+                parsed.meta.dat_size
+            );
+        }
+        if let Some(d) = self
+            .index
+            .find_dat(entry.depot, entry.version, parsed.meta.dat_crc)
+        {
+            let de = self.index.dat(d);
+            if de.size != parsed.meta.dat_size {
+                tracing::warn!(
+                    dat = de.path,
+                    "dat is {} bytes on disk, blob says {}{}",
+                    de.size,
+                    parsed.meta.dat_size,
+                    if de.incomplete {
+                        " (download in progress)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        self.parsed.lock().put(id, parsed.clone());
+        Ok(parsed)
+    }
+
+    /// The parent blob, resolved by the (version, crc) recorded in `id`.
+    /// Falls back to a unique blob with the parent's version number if the
+    /// exact crc is absent from the dump.
+    pub fn parent(&self, id: BlobId) -> Result<Option<BlobId>> {
+        let meta = self.parsed(id)?.meta;
+        let entry = self.index.blob(id);
+        let Some((pver, pcrc)) = meta.prev else {
+            return Ok(None);
+        };
+        if let Some(p) = self.index.find_blob(entry.depot, pver, pcrc) {
+            return Ok(Some(p));
+        }
+        let candidates = self.index.blobs_with_version(entry.depot, pver);
+        match candidates.as_slice() {
+            [only] => {
+                tracing::warn!(
+                    blob = entry.file_name,
+                    "parent crc {pcrc:08x} not found; using the only version-{pver} blob"
+                );
+                Ok(Some(*only))
+            }
+            [] => {
+                tracing::warn!(
+                    blob = entry.file_name,
+                    "parent version {pver} is missing from the dump"
+                );
+                Ok(None)
+            }
+            _ => {
+                tracing::warn!(
+                    blob = entry.file_name,
+                    "parent crc {pcrc:08x} not found and version {pver} is ambiguous"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Root-first chain of blobs ending at `id`.
+    pub fn chain(&self, id: BlobId) -> Result<Vec<BlobId>> {
+        let mut out = vec![id];
+        let mut cur = id;
+        while let Some(p) = self.parent(cur)? {
+            if out.contains(&p) || out.len() > 100_000 {
+                tracing::error!("version chain cycle at {}", self.index.blob(p).file_name);
+                break;
+            }
+            out.push(p);
+            cur = p;
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    // ---- file tables ------------------------------------------------------
+
+    /// File id -> location, as of version `id` (its own records overlaid on
+    /// its parent's table).
+    pub fn table(&self, id: BlobId) -> Result<Arc<FileTable>> {
+        if let Some(t) = self.tables.lock().get(&id) {
+            return Ok(t.clone());
+        }
+        let parsed = self.parsed(id)?;
+        let mut table: FileTable = match self.parent(id)? {
+            Some(p) => (*self.table(p)?).clone(),
+            None => HashMap::new(),
+        };
+        let entry = self.index.blob(id);
+        let dat = self
+            .index
+            .find_dat(entry.depot, entry.version, parsed.meta.dat_crc);
+        if dat.is_none() && !parsed.records.is_empty() {
+            tracing::warn!(
+                blob = entry.file_name,
+                "dat with crc {:08x} is missing; {} files unreadable",
+                parsed.meta.dat_crc,
+                parsed.records.len()
+            );
+        }
+        for r in &parsed.records {
+            let mut offsets = Vec::with_capacity(r.blocks.len() + 1);
+            let mut off = r.offset;
+            offsets.push(off);
+            for b in &r.blocks {
+                off += u64::from(b.compressed_size);
+                offsets.push(off);
+            }
+            table.insert(
+                r.file_id,
+                Arc::new(FileLoc {
+                    source: id,
+                    dat,
+                    record: r.clone(),
+                    offsets,
+                }),
+            );
+        }
+        let table = Arc::new(table);
+        self.tables.lock().put(id, table.clone());
+        Ok(table)
+    }
+
+    pub fn locate(&self, id: BlobId, file_id: u32) -> Result<Arc<FileLoc>> {
+        self.table(id)?
+            .get(&file_id)
+            .cloned()
+            .ok_or(ReadError::MissingRecord(file_id))
+    }
+
+    // ---- data ------------------------------------------------------------
+
+    fn raw_window(&self, dat: DatId, idx: u64) -> Result<Arc<Vec<u8>>> {
+        let key = (dat, idx);
+        if let Some(w) = self.raw.get(&key) {
+            return Ok(w);
+        }
+        let entry = self.index.dat(dat);
+        let start = idx * RAW_WINDOW;
+        let len = RAW_WINDOW.min(entry.size.saturating_sub(start)) as usize;
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            self.backend.read_at(&entry.path, start, len)?
+        };
+        let w = Arc::new(bytes);
+        self.raw.insert(key, w.clone());
+        Ok(w)
+    }
+
+    /// Stored bytes `[start, end)` of a dat, assembled from cached windows.
+    fn dat_bytes(&self, dat: DatId, start: u64, end: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity((end - start) as usize);
+        let mut pos = start;
+        while pos < end {
+            let idx = pos / RAW_WINDOW;
+            let w = self.raw_window(dat, idx)?;
+            let in_w = (pos - idx * RAW_WINDOW) as usize;
+            if in_w >= w.len() {
+                break;
+            }
+            let take = ((end - pos) as usize).min(w.len() - in_w);
+            out.extend_from_slice(&w[in_w..in_w + take]);
+            pos += take as u64;
+        }
+        Ok(out)
+    }
+
+    /// Which key decrypts data stored by blob `source`, resolving it on the
+    /// first encrypted block seen. `sample` is one raw encrypted block with
+    /// its mode and stored checksum, used to test candidates.
+    fn resolve_key(&self, source: BlobId, sample: (checksums::Mode, &[u8], u32)) -> KeyResolution {
+        if let Some(r) = self.resolved_keys.lock().get(&source) {
+            return *r;
+        }
+        let entry = self.index.blob(source);
+        let (mode, raw, expected) = sample;
+        let works = |k: &Key| chunk::decode_verified(mode, raw, Some(k), expected).is_ok();
+
+        let mut result = KeyResolution::None { tried: 0 };
+        if let Some(k) = self.keys.get_for_blob(entry.depot, entry.crc) {
+            if works(&k) {
+                result = KeyResolution::Configured(k);
+            } else {
+                tracing::warn!(
+                    blob = entry.file_name,
+                    "configured key for depot {} does not decrypt this blob",
+                    entry.depot
+                );
+            }
+        }
+        if matches!(result, KeyResolution::None { .. }) && self.cfg.key_search {
+            let mut tried = 0;
+            for (label, k) in self.keys.candidates() {
+                tried += 1;
+                if works(&k) {
+                    let from: u32 = label
+                        .split('@')
+                        .next()
+                        .and_then(|d| d.parse().ok())
+                        .unwrap_or(0);
+                    tracing::info!(
+                        blob = entry.file_name,
+                        "key search: depot {label}'s key decrypts it; add `{}@{:08x}={}` to a keys file",
+                        entry.depot,
+                        entry.crc,
+                        hex::encode(k)
+                    );
+                    result = KeyResolution::Discovered(k, from);
+                    break;
+                }
+            }
+            if matches!(result, KeyResolution::None { .. }) {
+                tracing::warn!(
+                    blob = entry.file_name,
+                    "key search: none of {tried} known keys decrypt this blob"
+                );
+                result = KeyResolution::None { tried };
+            }
+        }
+        self.resolved_keys.lock().insert(source, result);
+        result
+    }
+
+    /// Resolve the key for an encrypted file by reading its first block.
+    pub fn probe_key(&self, loc: &FileLoc) -> Result<KeyResolution> {
+        let dat = loc.dat.ok_or_else(|| self.missing_dat(loc))?;
+        let raw = self.dat_bytes(dat, loc.offsets[0], loc.offsets[1])?;
+        if raw.len() as u64 != loc.offsets[1] - loc.offsets[0] {
+            return Err(ReadError::ShortRead {
+                file_id: loc.record.file_id,
+                block: 0,
+                want: (loc.offsets[1] - loc.offsets[0]) as usize,
+                got: raw.len(),
+            });
+        }
+        Ok(self.resolve_key(
+            loc.source,
+            (loc.record.mode, &raw, loc.record.blocks[0].checksum),
+        ))
+    }
+
+    fn missing_dat(&self, loc: &FileLoc) -> ReadError {
+        let e = self.index.blob(loc.source);
+        ReadError::MissingDat {
+            depot: e.depot,
+            version: e.version,
+            crc: self.parsed(loc.source).map(|p| p.meta.dat_crc).unwrap_or(0),
+        }
+    }
+
+    /// Decoded bytes of block `i` of a file.
+    pub fn block(&self, loc: &FileLoc, i: usize) -> Result<Arc<Vec<u8>>> {
+        let dat = loc.dat.ok_or_else(|| {
+            let e = self.index.blob(loc.source);
+            ReadError::MissingDat {
+                depot: e.depot,
+                version: e.version,
+                crc: self.parsed(loc.source).map(|p| p.meta.dat_crc).unwrap_or(0),
+            }
+        })?;
+        let start = loc.offsets[i];
+        let end = loc.offsets[i + 1];
+        let key = (dat, start);
+        if let Some(b) = self.blocks.get(&key) {
+            return Ok(b);
+        }
+        let rec = &loc.record;
+        let raw = self.dat_bytes(dat, start, end)?;
+        if raw.len() as u64 != end - start {
+            return Err(ReadError::ShortRead {
+                file_id: rec.file_id,
+                block: i,
+                want: (end - start) as usize,
+                got: raw.len(),
+            });
+        }
+        let entry = self.index.blob(loc.source);
+        let key_bytes = if rec.mode.is_encrypted() {
+            match self.resolve_key(loc.source, (rec.mode, &raw, rec.blocks[i].checksum)) {
+                KeyResolution::Configured(k) | KeyResolution::Discovered(k, _) => Some(k),
+                KeyResolution::None { tried: 0 } => return Err(ReadError::NoKey(entry.depot)),
+                KeyResolution::None { tried } => {
+                    return Err(ReadError::NoWorkingKey {
+                        depot: entry.depot,
+                        crc: entry.crc,
+                        tried,
+                    })
+                }
+            }
+        } else {
+            None
+        };
+        let decoded = chunk::decode(rec.mode, &raw, key_bytes.as_ref())?;
+        if self.cfg.verify {
+            let actual = chunk::checksum(&decoded);
+            let expected = rec.blocks[i].checksum;
+            if actual != expected {
+                return Err(ReadError::Checksum {
+                    file_id: rec.file_id,
+                    block: i,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        let (bs, be) = rec.block_range(i);
+        if decoded.len() as u64 != be - bs {
+            tracing::debug!(
+                file_id = rec.file_id,
+                block = i,
+                "decoded {} bytes, expected {}",
+                decoded.len(),
+                be - bs
+            );
+        }
+        let decoded = Arc::new(decoded);
+        self.blocks.insert(key, decoded.clone());
+        Ok(decoded)
+    }
+
+    /// Read `len` decoded bytes of a file starting at `offset`.
+    pub fn read(&self, loc: &FileLoc, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let size = loc.record.size;
+        if offset >= size || len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = (offset + len as u64).min(size);
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        let mut pos = offset;
+        while pos < end {
+            let i = (pos / BLOCK_SIZE) as usize;
+            if i >= loc.record.num_blocks() {
+                break;
+            }
+            let block = self.block(loc, i)?;
+            let in_block = (pos % BLOCK_SIZE) as usize;
+            if in_block >= block.len() {
+                break;
+            }
+            let take = ((end - pos) as usize).min(block.len() - in_block);
+            out.extend_from_slice(&block[in_block..in_block + take]);
+            pos += take as u64;
+        }
+        Ok(out)
+    }
+
+    #[allow(dead_code)]
+    pub fn cache_stats(&self) -> (usize, usize) {
+        (self.raw.bytes(), self.blocks.bytes())
+    }
+}
+
+pub fn parse_blob(bytes: &[u8]) -> anyhow::Result<ParsedBlob> {
+    let top = Blob::parse(bytes)?;
+    let meta = VersionMeta::from_blob(&top)?;
+    let manifest_wrapper = blob::decompress(top.require(blob::keys::MANIFEST)?)?;
+    let inner = Blob::parse(&manifest_wrapper)?;
+    let manifest = Manifest::parse(inner.require(0)?)?;
+    let fingerprint = top.u32(blob::keys::MANIFEST_FINGERPRINT)?;
+    anyhow::ensure!(
+        fingerprint == manifest.fingerprint,
+        "blob key 2 {fingerprint:08x} != manifest fingerprint {:08x}",
+        manifest.fingerprint
+    );
+    // Key 10 is the crc32 of the whole blob with its own value zeroed.
+    let own = top.require(blob::keys::OWN_CRC)?;
+    let off = own.as_ptr() as usize - bytes.as_ptr() as usize;
+    let mut h = crc32fast::Hasher::new();
+    h.update(&bytes[..off]);
+    h.update(&[0u8; 4]);
+    h.update(&bytes[off + 4..]);
+    let crc = h.finalize();
+    anyhow::ensure!(
+        crc == meta.own_crc,
+        "blob crc {crc:08x} != key 10 {:08x}",
+        meta.own_crc
+    );
+    let records = checksums::parse(top.require(blob::keys::CHECKSUMS)?)?;
+    Ok(ParsedBlob {
+        meta,
+        manifest: Arc::new(manifest),
+        records,
+    })
+}
