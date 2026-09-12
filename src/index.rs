@@ -303,7 +303,12 @@ impl Index {
                     (name, link)
                 })
                 .collect();
-            depot.index_of = depot.blobs.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+            depot.index_of = depot
+                .blobs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (*b, i))
+                .collect();
             depot.by_name = depot
                 .names
                 .iter()

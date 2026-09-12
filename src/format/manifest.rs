@@ -182,7 +182,10 @@ impl Manifest {
             // `first_child`/`next_sibling` terminate at 0 (and, defensively,
             // at NO_NODE); anything else must be a real node, or walking the
             // tree would index out of bounds.
-            for (link, what) in [(n.first_child, "first child"), (n.next_sibling, "next sibling")] {
+            for (link, what) in [
+                (n.first_child, "first child"),
+                (n.next_sibling, "next sibling"),
+            ] {
                 if link != 0 && link != NO_NODE && link as usize >= m.nodes.len() {
                     return Err(malformed(format!("node {i}: {what} {link} out of range")));
                 }
