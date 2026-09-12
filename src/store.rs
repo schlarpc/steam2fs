@@ -214,37 +214,71 @@ impl Store {
 
     // ---- blobs -----------------------------------------------------------
 
-    /// Raw bytes of a blob, via the on-disk cache when configured. A blob's
-    /// name embeds the sha256 of its contents, so a cache entry is keyed by
-    /// what it should contain and is checked against it on the way out; a
-    /// name without a full hash falls back to a size check.
-    pub fn blob_bytes(&self, id: BlobId) -> anyhow::Result<Vec<u8>> {
-        let entry = self.index.blob(id);
-        let cached = self
-            .cfg
+    fn cache_path(&self, id: BlobId) -> Option<PathBuf> {
+        self.cfg
             .blob_cache_dir
             .as_ref()
-            .map(|d| d.join(&entry.file_name));
-        if let Some(p) = &cached {
-            if let Ok(bytes) = std::fs::read(p) {
-                match check_contents(entry, &bytes) {
-                    Ok(()) => return Ok(bytes),
-                    Err(e) => tracing::warn!(
-                        path = %p.display(),
-                        "ignoring cached blob: {e:#}"
-                    ),
+            .map(|d| d.join(&self.index.blob(id).file_name))
+    }
+
+    /// Raw bytes of a blob, and whether they came from the on-disk cache.
+    ///
+    /// The cache is only size-checked here: hashing every cached blob costs
+    /// more than the parse it feeds, and `parse_blob` verifies the blob's
+    /// own crc32 (key 10) anyway, so corruption surfaces there and
+    /// `parse_uncached` refetches. The sha256 in the name is checked on the
+    /// way in from the backend, where it is amortised against the transfer.
+    fn blob_bytes_cached(&self, id: BlobId) -> anyhow::Result<(Vec<u8>, bool)> {
+        let entry = self.index.blob(id);
+        if let Some(p) = self.cache_path(id) {
+            if let Ok(bytes) = std::fs::read(&p) {
+                if bytes.len() as u64 == entry.size {
+                    return Ok((bytes, true));
                 }
+                tracing::warn!(
+                    path = %p.display(),
+                    "cached blob is {} bytes, expected {}; refetching",
+                    bytes.len(),
+                    entry.size
+                );
             }
         }
+        Ok((self.fetch_blob(id)?, false))
+    }
+
+    #[allow(dead_code)] // the parse path wants to know where the bytes came from
+    pub fn blob_bytes(&self, id: BlobId) -> anyhow::Result<Vec<u8>> {
+        Ok(self.blob_bytes_cached(id)?.0)
+    }
+
+    /// Read a blob from the backend, check it against the sha256 in its
+    /// name, and populate the on-disk cache.
+    fn fetch_blob(&self, id: BlobId) -> anyhow::Result<Vec<u8>> {
+        let entry = self.index.blob(id);
         let bytes = self.backend.read_all(&entry.path)?;
-        check_contents(entry, &bytes)?;
-        if let Some(p) = &cached {
+        if let Some(expected) = entry.sha256.as_deref() {
+            let actual = hex::encode(sha2::Sha256::digest(&bytes));
+            anyhow::ensure!(
+                actual == expected,
+                "{}: sha256 {actual} does not match its name",
+                entry.file_name
+            );
+        } else {
+            anyhow::ensure!(
+                bytes.len() as u64 == entry.size,
+                "{}: {} bytes, expected {}",
+                entry.file_name,
+                bytes.len(),
+                entry.size
+            );
+        }
+        if let Some(p) = self.cache_path(id) {
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             let tmp = p.with_extension("blob.tmp");
             if std::fs::write(&tmp, &bytes)
-                .and_then(|()| std::fs::rename(&tmp, p))
+                .and_then(|()| std::fs::rename(&tmp, &p))
                 .is_err()
             {
                 let _ = std::fs::remove_file(&tmp);
@@ -264,10 +298,28 @@ impl Store {
         if let Some(p) = self.parsed.lock().get(&id) {
             return Ok(p.clone());
         }
-        let bytes = self.blob_bytes(id)?;
+        let (bytes, from_cache) = self.blob_bytes_cached(id)?;
         let entry = self.index.blob(id);
-        let parsed =
-            Arc::new(parse_blob(&bytes).with_context(|| format!("parsing {}", entry.file_name))?);
+        let parsed = match parse_blob(&bytes) {
+            Ok(p) => Arc::new(p),
+            // parse_blob checks the blob's own crc32, so a cache entry that
+            // has rotted lands here. Drop it and refetch, rather than
+            // failing the same way on every mount from now on.
+            Err(e) if from_cache => {
+                tracing::warn!(
+                    blob = entry.file_name,
+                    "cached blob did not parse ({e:#}); refetching"
+                );
+                if let Some(p) = self.cache_path(id) {
+                    let _ = std::fs::remove_file(p);
+                }
+                let bytes = self.fetch_blob(id)?;
+                Arc::new(
+                    parse_blob(&bytes).with_context(|| format!("parsing {}", entry.file_name))?,
+                )
+            }
+            Err(e) => return Err(e.context(format!("parsing {}", entry.file_name)).into()),
+        };
         // Cross-checks between the pieces of a blob and its file name.
         if parsed.meta.own_crc != entry.crc {
             tracing::warn!(
@@ -693,29 +745,6 @@ impl Store {
     pub fn cache_stats(&self) -> (usize, usize) {
         (self.raw.bytes(), self.blocks.bytes())
     }
-}
-
-/// Check bytes against what a blob's file name says they should be: its
-/// sha256 when the name carries the full hash, its size otherwise.
-fn check_contents(entry: &crate::index::BlobEntry, bytes: &[u8]) -> anyhow::Result<()> {
-    match entry.sha256.as_deref() {
-        Some(expected) => {
-            let actual = hex::encode(sha2::Sha256::digest(bytes));
-            anyhow::ensure!(
-                actual == expected,
-                "{}: sha256 {actual} does not match its name",
-                entry.file_name
-            );
-        }
-        None => anyhow::ensure!(
-            bytes.len() as u64 == entry.size,
-            "{}: {} bytes, expected {}",
-            entry.file_name,
-            bytes.len(),
-            entry.size
-        ),
-    }
-    Ok(())
 }
 
 pub fn parse_blob(bytes: &[u8]) -> anyhow::Result<ParsedBlob> {

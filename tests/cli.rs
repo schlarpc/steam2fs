@@ -125,13 +125,14 @@ fn blob_cache_round_trips_and_rejects_corruption() {
         .collect();
     assert!(!cached.is_empty(), "nothing was cached");
 
-    // A cached blob whose contents no longer match the hash in its name is
-    // ignored and refetched, not served.
+    // A cached blob that has rotted fails its own crc32 when parsed. That
+    // has to heal itself by refetching, not fail the same way forever.
     let victim = cached
         .iter()
         .find(|p| p.extension().is_some_and(|e| e == "blob"))
         .unwrap();
-    let mut bytes = std::fs::read(victim).unwrap();
+    let good = std::fs::read(victim).unwrap();
+    let mut bytes = good.clone();
     let len = bytes.len();
     bytes[len / 2] ^= 0xff;
     std::fs::write(victim, &bytes).unwrap();
@@ -139,7 +140,19 @@ fn blob_cache_round_trips_and_rejects_corruption() {
     let out = run();
     assert!(out.status.success());
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(err.contains("ignoring cached blob"), "{err}");
+    assert!(err.contains("did not parse"), "{err}");
+    assert_eq!(
+        std::fs::read(victim).unwrap(),
+        good,
+        "the rotted cache entry should have been replaced"
+    );
+
+    // A truncated one is caught by the size check before it is even parsed.
+    std::fs::write(victim, &good[..good.len() / 2]).unwrap();
+    let out = run();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("expected"), "{err}");
 
     let _ = std::fs::remove_dir_all(&cache);
 }
