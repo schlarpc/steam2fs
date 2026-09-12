@@ -603,7 +603,7 @@ impl Store {
         } else {
             None
         };
-        let decoded = chunk::decode(rec.mode, &raw, key_bytes.as_ref())?;
+        let decoded = chunk::decode_owned(rec.mode, raw, key_bytes.as_ref())?;
         if self.cfg.verify {
             let actual = chunk::checksum(&decoded);
             let expected = block_meta.checksum;
@@ -628,7 +628,12 @@ impl Store {
             });
         }
         let decoded = Arc::new(decoded);
-        self.blocks.insert(key, decoded.clone());
+        // A plain block's decoded bytes are exactly its stored bytes, which
+        // the raw-window cache already holds; caching them again would spend
+        // the block cache storing a second copy of the raw one.
+        if rec.mode != checksums::Mode::Plain {
+            self.blocks.insert(key, decoded.clone());
+        }
         Ok(decoded)
     }
 
