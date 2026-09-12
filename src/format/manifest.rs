@@ -179,6 +179,14 @@ impl Manifest {
             if n.parent != NO_NODE && n.parent as usize >= m.nodes.len() {
                 return Err(malformed(format!("node {i}: parent out of range")));
             }
+            // `first_child`/`next_sibling` terminate at 0 (and, defensively,
+            // at NO_NODE); anything else must be a real node, or walking the
+            // tree would index out of bounds.
+            for (link, what) in [(n.first_child, "first child"), (n.next_sibling, "next sibling")] {
+                if link != 0 && link != NO_NODE && link as usize >= m.nodes.len() {
+                    return Err(malformed(format!("node {i}: {what} {link} out of range")));
+                }
+            }
         }
         let mut by_name = HashMap::with_capacity(m.nodes.len());
         for i in 0..m.nodes.len() {
@@ -200,8 +208,12 @@ impl Manifest {
     }
 
     /// Raw name bytes of a node (names are not guaranteed to be UTF-8).
+    /// Empty for an unknown node; `parse` has already range-checked every
+    /// name offset, so a real node always has a name.
     pub fn name(&self, idx: u32) -> &[u8] {
-        let start = self.nodes[idx as usize].name_offset as usize;
+        let Some(start) = self.nodes.get(idx as usize).map(|n| n.name_offset as usize) else {
+            return &[];
+        };
         let rest = &self.string_table[start..];
         let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
         &rest[..end]
@@ -260,7 +272,11 @@ impl Iterator for Children<'_> {
         }
         let cur = self.next;
         self.remaining -= 1;
-        self.next = self.manifest.node(cur).map_or(0, |n| n.next_sibling);
+        let Some(node) = self.manifest.node(cur) else {
+            self.next = 0;
+            return None;
+        };
+        self.next = node.next_sibling;
         Some(cur)
     }
 }
@@ -329,6 +345,37 @@ mod tests {
         assert_eq!(flags::describe(0x400a), "file,copy_local");
         assert_eq!(flags::describe(0x4100), "file,encrypted");
         assert_eq!(flags::describe(0), "directory");
+    }
+
+    /// Rebuild a manifest buffer after mutating one node field.
+    fn with_node_field(node: usize, field: usize, value: u32) -> Vec<u8> {
+        let mut buf = sample();
+        let off = HEADER_SIZE + node * NODE_SIZE + field * 4;
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        let zeroed = {
+            let mut b = buf.clone();
+            b[0x30..0x38].fill(0);
+            b
+        };
+        let ck = checksum(&zeroed);
+        buf[0x34..0x38].copy_from_slice(&ck.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn rejects_out_of_range_links() {
+        // field 6 is first_child, field 5 is next_sibling.
+        assert!(Manifest::parse(&with_node_field(0, 6, 99)).is_err());
+        assert!(Manifest::parse(&with_node_field(1, 5, 99)).is_err());
+        // 0 and NO_NODE are terminators, not indices.
+        assert!(Manifest::parse(&with_node_field(2, 5, 0)).is_ok());
+        assert!(Manifest::parse(&with_node_field(2, 5, NO_NODE)).is_ok());
+    }
+
+    #[test]
+    fn unknown_node_has_no_name() {
+        let m = Manifest::parse(&sample()).unwrap();
+        assert_eq!(m.name(999), b"");
     }
 
     #[test]
