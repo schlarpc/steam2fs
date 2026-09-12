@@ -1,6 +1,7 @@
-//! steam2fs: a read-only, time-travelling FUSE view over a Steam2 content
-//! server dump (blob + dat files), served straight from the archive without
-//! extracting anything.
+//! steam2fs: a read-only, time-travelling view over a Steam2 content server
+//! dump (blob + dat files), served straight from the archive without
+//! extracting anything. It mounts through FUSE on unix and WinFsp on
+//! Windows.
 
 // Manifest node indices are u32 on disk.
 #![allow(clippy::cast_possible_truncation)]
@@ -8,11 +9,14 @@
 mod backend;
 mod cache;
 mod format;
+#[cfg(unix)]
 mod fs;
 mod index;
 mod keys;
 mod store;
 mod tree;
+#[cfg(windows)]
+mod winfs;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,11 +82,14 @@ enum Command {
     Mount {
         #[command(flatten)]
         source: SourceArgs,
+        /// Where to mount: a directory, or on Windows a drive letter such
+        /// as `R:` (a directory path works there too).
         mountpoint: PathBuf,
-        /// Let other users access the mount (needs `user_allow_other` in /etc/fuse.conf).
+        /// Let other users access the mount (needs `user_allow_other` in
+        /// /etc/fuse.conf). Unix only.
         #[arg(long)]
         allow_other: bool,
-        /// FUSE worker threads.
+        /// Filesystem worker threads.
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
@@ -125,6 +132,20 @@ enum Command {
     },
 }
 
+/// `$XDG_CACHE_HOME/steam2fs/blobs`, or the Windows equivalent.
+fn default_cache_dir() -> anyhow::Result<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .context("no cache directory in the environment; pass --cache-dir")?;
+    Ok(base.join("steam2fs").join("blobs"))
+}
+
 fn open_store(args: &SourceArgs) -> anyhow::Result<Arc<Store>> {
     let source = backend::parse_source(&args.source);
     tracing::info!(?source, "opening backend");
@@ -145,13 +166,7 @@ fn open_store(args: &SourceArgs) -> anyhow::Result<Arc<Store>> {
     } else {
         Some(match &args.cache_dir {
             Some(d) => d.clone(),
-            None => {
-                let base = std::env::var_os("XDG_CACHE_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-                    .context("no XDG_CACHE_HOME or HOME; pass --cache-dir")?;
-                base.join("steam2fs").join("blobs")
-            }
+            None => default_cache_dir()?,
         })
     };
     if let Some(d) = &blob_cache_dir {
@@ -478,6 +493,40 @@ fn key_audit(
     Ok(())
 }
 
+#[cfg(unix)]
+fn mount(
+    store: Arc<Store>,
+    mountpoint: &std::path::Path,
+    allow_other: bool,
+    threads: usize,
+) -> anyhow::Result<()> {
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![
+        fuser::MountOption::RO,
+        fuser::MountOption::FSName("steam2fs".into()),
+        fuser::MountOption::Subtype("steam2fs".into()),
+        fuser::MountOption::DefaultPermissions,
+    ];
+    if allow_other {
+        config.acl = fuser::SessionACL::All;
+    }
+    config.n_threads = Some(threads);
+    fuser::mount(fs::Steam2Fs::new(store), mountpoint, &config).context("mount")
+}
+
+#[cfg(windows)]
+fn mount(
+    store: Arc<Store>,
+    mountpoint: &std::path::Path,
+    allow_other: bool,
+    threads: usize,
+) -> anyhow::Result<()> {
+    if allow_other {
+        tracing::warn!("--allow-other has no effect on Windows; use WinFsp's own access control");
+    }
+    winfs::mount(store, mountpoint, threads)
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -495,21 +544,8 @@ fn main() -> anyhow::Result<()> {
             threads,
         } => {
             let store = open_store(&source)?;
-            let options = vec![
-                fuser::MountOption::RO,
-                fuser::MountOption::FSName("steam2fs".into()),
-                fuser::MountOption::Subtype("steam2fs".into()),
-                fuser::MountOption::DefaultPermissions,
-            ];
-            let mut config = fuser::Config::default();
-            if allow_other {
-                config.acl = fuser::SessionACL::All;
-            }
-            config.mount_options = options;
-            config.n_threads = Some(threads.max(1));
             tracing::info!(mountpoint = %mountpoint.display(), "mounting");
-            fuser::mount(fs::Steam2Fs::new(store), &mountpoint, &config).context("mount")?;
-            Ok(())
+            mount(store, &mountpoint, allow_other, threads.max(1))
         }
         Command::Inspect {
             source,

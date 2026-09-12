@@ -100,6 +100,7 @@
 
           buildPhase = ''
             xwin \
+              --http-retry 5 \
               --accept-license \
               --cache-dir "$TMPDIR/xwin-cache" \
               --manifest-version 17 \
@@ -146,6 +147,19 @@
             "-imsvc${xwinSdk}/sdk/include/ucrt"
             "-imsvc${xwinSdk}/sdk/include/um"
             "-imsvc${xwinSdk}/sdk/include/shared"
+          ];
+
+          # winfsp-sys runs bindgen over WinFsp's headers for the Windows
+          # target, which needs libclang plus the same MSVC/SDK includes the
+          # cc crate gets above. bindgen drives clang through libclang's
+          # gcc-style driver, so these are `-isystem`, not clang-cl's
+          # `-imsvc`.
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_msvc = builtins.concatStringsSep " " [
+            "-isystem${xwinSdk}/crt/include"
+            "-isystem${xwinSdk}/sdk/include/ucrt"
+            "-isystem${xwinSdk}/sdk/include/um"
+            "-isystem${xwinSdk}/sdk/include/shared"
           ];
 
           # Windows binaries can't run on the build host

@@ -1,5 +1,8 @@
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -28,11 +31,25 @@ impl LocalBackend {
     }
 }
 
+/// One positional read. Unix has `read_at`; Windows spells the same thing
+/// `seek_read`, which moves the handle's own cursor as a side effect — we
+/// open a fresh handle per read, so nothing else sees it.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        file.seek_read(buf, offset)
+    }
+}
+
 fn read_range(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     let mut filled = 0;
     while filled < len {
-        let n = file.read_at(&mut buf[filled..], offset + filled as u64)?;
+        let n = read_at(file, &mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
             break;
         }

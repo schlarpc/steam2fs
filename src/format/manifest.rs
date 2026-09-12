@@ -25,6 +25,7 @@ pub const NO_NODE: u32 = u32::MAX;
 pub const NO_FILE: u32 = u32::MAX;
 
 /// Node flag bits (names follow HLLib's GCF manifest flags).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub mod flags {
     /// Set on every file node.
     pub const FILE: u32 = 0x4000;
