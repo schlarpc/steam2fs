@@ -18,7 +18,7 @@ use anyhow::Context;
 use parking_lot::Mutex;
 
 use crate::backend::Backend;
-use crate::cache::ByteLru;
+use crate::cache::{ByteLru, SingleFlight};
 use crate::format::blob::{self, Blob, VersionMeta};
 use crate::format::checksums::{self, FileRecord};
 use crate::format::chunk::{self, Key};
@@ -182,6 +182,11 @@ pub struct Store {
     tables: Mutex<lru::LruCache<BlobId, Arc<FileTable>>>,
     raw: ByteLru<(DatId, u64)>,
     blocks: ByteLru<(DatId, u64)>,
+    /// Keeps concurrent misses from parsing the same blob, rebuilding the
+    /// same file table, or fetching the same dat window twice over.
+    blob_flight: SingleFlight<BlobId>,
+    table_flight: SingleFlight<BlobId>,
+    window_flight: SingleFlight<(DatId, u64)>,
     /// Per source blob: which key actually decrypts it (resolved lazily).
     resolved_keys: Mutex<HashMap<BlobId, KeyResolution>>,
 }
@@ -199,6 +204,9 @@ impl Store {
             parsed: Mutex::new(lru::LruCache::new(cap(512))),
             tables: Mutex::new(lru::LruCache::new(cap(256))),
             resolved_keys: Mutex::new(HashMap::new()),
+            blob_flight: SingleFlight::new(),
+            table_flight: SingleFlight::new(),
+            window_flight: SingleFlight::new(),
         }
     }
 
@@ -253,6 +261,13 @@ impl Store {
     }
 
     pub fn parsed(&self, id: BlobId) -> Result<Arc<ParsedBlob>> {
+        if let Some(p) = self.parsed.lock().get(&id) {
+            return Ok(p.clone());
+        }
+        self.blob_flight.dedupe(&id, || self.parse_uncached(id))
+    }
+
+    fn parse_uncached(&self, id: BlobId) -> Result<Arc<ParsedBlob>> {
         if let Some(p) = self.parsed.lock().get(&id) {
             return Ok(p.clone());
         }
@@ -375,6 +390,13 @@ impl Store {
         if let Some(t) = self.tables.lock().get(&id) {
             return Ok(t.clone());
         }
+        self.table_flight.dedupe(&id, || self.build_table(id))
+    }
+
+    fn build_table(&self, id: BlobId) -> Result<Arc<FileTable>> {
+        if let Some(t) = self.tables.lock().get(&id) {
+            return Ok(t.clone());
+        }
         let mut parent: Option<Arc<FileTable>> = None;
         for b in self.chain(id)? {
             if let Some(t) = self.tables.lock().get(&b) {
@@ -436,6 +458,17 @@ impl Store {
     // ---- data ------------------------------------------------------------
 
     fn raw_window(&self, dat: DatId, idx: u64) -> Result<Arc<Vec<u8>>> {
+        let key = (dat, idx);
+        if let Some(w) = self.raw.get(&key) {
+            return Ok(w);
+        }
+        // A window is a megabyte off a possibly remote disk; two threads
+        // reading neighbouring blocks should not fetch it twice.
+        self.window_flight
+            .dedupe(&key, || self.fetch_window(dat, idx))
+    }
+
+    fn fetch_window(&self, dat: DatId, idx: u64) -> Result<Arc<Vec<u8>>> {
         let key = (dat, idx);
         if let Some(w) = self.raw.get(&key) {
             return Ok(w);
