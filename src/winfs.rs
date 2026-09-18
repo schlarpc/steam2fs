@@ -23,6 +23,8 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
@@ -349,6 +351,66 @@ impl FileSystemContext for Steam2WinFs {
     }
 }
 
+/// The WinFsp DLL for this architecture, as the installer names it.
+const WINFSP_DLL: &str = if cfg!(target_arch = "x86_64") {
+    "winfsp-x64.dll"
+} else if cfg!(target_arch = "aarch64") {
+    "winfsp-a64.dll"
+} else {
+    "winfsp-x86.dll"
+};
+
+/// Read WinFsp's `InstallDir` registry value from `subkey` under HKLM.
+fn registry_install_dir(subkey: &str) -> Option<std::path::PathBuf> {
+    let subkey = U16CString::from_str(subkey).ok()?;
+    let mut buf = [0u16; 1024];
+    let mut size = u32::try_from(std::mem::size_of_val(&buf)).ok()?;
+    #[allow(unsafe_code)]
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            windows::core::w!("InstallDir"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    let len = usize::try_from(size).ok()? / std::mem::size_of::<u16>();
+    let dir = U16CStr::from_slice_truncate(&buf[..len]).ok()?;
+    Some(dir.to_os_string().into())
+}
+
+/// Load the WinFsp DLL from wherever the installer put it.
+///
+/// The `winfsp` crate's `winfsp_init` only tries a bare `LoadLibraryW`,
+/// which searches the exe directory and `PATH`; the installer adds its
+/// `bin` directory to neither. Its registry fallback sits behind a
+/// `system` feature whose build script cannot run on a non-Windows host,
+/// so we do the lookup here. Once the module is in the process, both the
+/// crate's bare-name load and the delay-load helper resolve to it.
+fn preload_winfsp() -> Option<std::path::PathBuf> {
+    // The x64/x86 installer is a 32-bit MSI and lands in WOW6432Node; the
+    // native ARM64 installer writes directly under SOFTWARE.
+    let dir = registry_install_dir("SOFTWARE\\WOW6432Node\\WinFsp")
+        .or_else(|| registry_install_dir("SOFTWARE\\WinFsp"))?;
+    let dll = dir.join("bin").join(WINFSP_DLL);
+    let wide = U16CString::from_os_str(dll.as_os_str()).ok()?;
+    #[allow(unsafe_code)]
+    let loaded = unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) };
+    match loaded {
+        Ok(_) => Some(dll),
+        Err(e) => {
+            tracing::debug!("LoadLibraryW({}): {e:?}", dll.display());
+            None
+        }
+    }
+}
+
 /// Mount the store at `mountpoint` (a drive letter such as `R:`, or a
 /// directory) until the process is interrupted.
 pub fn mount(
@@ -356,6 +418,10 @@ pub fn mount(
     mountpoint: &std::path::Path,
     threads: usize,
 ) -> anyhow::Result<()> {
+    match preload_winfsp() {
+        Some(dll) => tracing::debug!("loaded {}", dll.display()),
+        None => tracing::debug!("no WinFsp install found in the registry"),
+    }
     // Holding the token keeps the delay-loaded DLL resolved for the mount.
     let _init = winfsp::winfsp_init().map_err(|e| {
         tracing::debug!("winfsp_init: {e:?}");
