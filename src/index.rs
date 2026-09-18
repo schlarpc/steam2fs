@@ -6,7 +6,7 @@
 //! download in progress carries a trailing `.!qB`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 
@@ -204,6 +204,7 @@ impl Index {
     pub fn load(backend: &dyn Backend) -> anyhow::Result<Self> {
         let mut idx = Index::default();
 
+        let started = Instant::now();
         let dates = match backend.read_all("blobs_dates.txt") {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
@@ -215,7 +216,11 @@ impl Index {
                         }
                     }
                 }
-                tracing::info!(count = m.len(), "loaded blob dates");
+                tracing::info!(
+                    count = m.len(),
+                    elapsed = ?started.elapsed(),
+                    "read blobs_dates.txt"
+                );
                 m
             }
             Err(e) => {
@@ -224,7 +229,13 @@ impl Index {
             }
         };
 
+        let started = Instant::now();
         let blob_entries = backend.list_dir("blobs").context("listing blobs/")?;
+        tracing::info!(
+            entries = blob_entries.len(),
+            elapsed = ?started.elapsed(),
+            "listed blobs/"
+        );
         for e in blob_entries {
             let Some((p, sha)) = parse_name(&e.name, ".blob") else {
                 if !e.is_dir {
@@ -247,7 +258,13 @@ impl Index {
             idx.depots.entry(p.depot).or_default().blobs.push(id);
         }
 
+        let started = Instant::now();
         let dat_entries = backend.list_dir("dats").context("listing dats/")?;
+        tracing::info!(
+            entries = dat_entries.len(),
+            elapsed = ?started.elapsed(),
+            "listed dats/"
+        );
         for e in dat_entries {
             let (name, incomplete) = match e.name.strip_suffix(".!qB") {
                 Some(n) => (n, true),

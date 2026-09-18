@@ -418,6 +418,7 @@ pub fn mount(
     mountpoint: &std::path::Path,
     threads: usize,
 ) -> anyhow::Result<()> {
+    tracing::info!("loading WinFsp");
     match preload_winfsp() {
         Some(dll) => tracing::debug!("loaded {}", dll.display()),
         None => tracing::debug!("no WinFsp install found in the registry"),
@@ -454,10 +455,12 @@ pub fn mount(
     // dispatcher threads at once, which is what the store is built for.
     let mut host: FileSystemHost<Steam2WinFs> = FileSystemHost::new(params, context)
         .map_err(|e| anyhow!("creating the WinFsp filesystem: {e}"))?;
+    let started = std::time::Instant::now();
     host.mount(mountpoint.to_path_buf())
         .map_err(|e| anyhow!("mounting at {}: {e}", mountpoint.display()))?;
     host.start_with_threads(threads as u32)
         .map_err(|e| anyhow!("starting the WinFsp dispatcher: {e}"))?;
+    tracing::debug!(elapsed = ?started.elapsed(), "WinFsp volume started");
 
     // Required by WinFsp's FLOSS exception, which is what lets a
     // non-GPL-licensed program link its DLL at all.

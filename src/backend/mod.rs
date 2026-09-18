@@ -17,7 +17,6 @@ pub struct DirEntry {
 
 pub trait Backend: Send + Sync {
     /// Human-readable description for logs.
-    #[allow(dead_code)]
     fn describe(&self) -> String;
 
     /// List one directory, relative to the dump root (`""` for the root).

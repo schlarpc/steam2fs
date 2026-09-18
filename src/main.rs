@@ -20,6 +20,7 @@ mod winfs;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
@@ -149,7 +150,13 @@ fn default_cache_dir() -> anyhow::Result<PathBuf> {
 fn open_store(args: &SourceArgs) -> anyhow::Result<Arc<Store>> {
     let source = backend::parse_source(&args.source);
     tracing::info!(?source, "opening backend");
+    let started = Instant::now();
     let backend = backend::open(&source)?;
+    tracing::info!(
+        backend = backend.describe(),
+        elapsed = ?started.elapsed(),
+        "opened backend"
+    );
     let index = Index::load(&*backend).context("indexing the dump")?;
 
     let mut keys = KeyStore::new();

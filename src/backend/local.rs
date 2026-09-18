@@ -4,6 +4,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Context;
 
@@ -66,19 +67,36 @@ impl Backend for LocalBackend {
 
     fn list_dir(&self, rel: &str) -> anyhow::Result<Vec<DirEntry>> {
         let dir = self.path(rel);
+        let started = Instant::now();
         let mut out = Vec::new();
+        let mut followed = 0usize;
         for entry in
             std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?
         {
             let entry = entry?;
-            // Follow symlinks so a dump assembled from links reports real sizes.
-            let meta = std::fs::metadata(entry.path())?;
+            // `DirEntry::metadata` comes from the directory listing itself on
+            // Windows and is one lstat on unix; either way it does not
+            // follow symlinks. Only a link needs the extra round trip to
+            // learn the real size, which matters over a network filesystem
+            // where every per-file call is a separate request.
+            let mut meta = entry.metadata()?;
+            if meta.file_type().is_symlink() {
+                followed += 1;
+                meta = std::fs::metadata(entry.path())?;
+            }
             out.push(DirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 size: meta.len(),
                 is_dir: meta.is_dir(),
             });
         }
+        tracing::debug!(
+            dir = %dir.display(),
+            entries = out.len(),
+            symlinks_followed = followed,
+            elapsed = ?started.elapsed(),
+            "listed directory"
+        );
         Ok(out)
     }
 
