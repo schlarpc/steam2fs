@@ -40,7 +40,7 @@ libc = "0.2"
 winfsp = "0.13"
 widestring = "1"
 # Must match the `windows` version winfsp exposes in its public API.
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
